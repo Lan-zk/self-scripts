@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         职行力自动刷课助手
 // @namespace    https://github.com/Lan-zk
-// @version      3.16
+// @version      3.17
 // @description  自动播放和评价职行力课程。克制的辅助仪器界面（闲置淡化/可折叠微标/提示分级静默）；多讲课程收尾防循环；后台持续推进；设置抽屉免改代码；全量日志。
 // @author       Lan-zk
 // @source       https://greasyfork.org/scripts/455353
@@ -30,7 +30,7 @@
 (function () {
   "use strict";
 
-  const VERSION = "3.15";
+  const VERSION = "3.17";
   const LOG_MAX = 2500; // 日志最多保留条数（超出丢弃最旧的；抽屉里最多渲染 800 条）
 
   // ===================== 配置 =====================
@@ -85,6 +85,7 @@
         else if (!isNum && v !== undefined) CFG[k] = v;
       }
     }
+    syncSettingsForm(); // 设置抽屉已渲染时，把保存值回填进表单（否则显示默认值，像被重置）
   }
   function saveUserConfig() {
     const out = {};
@@ -1775,6 +1776,27 @@
     document.getElementById("zk-settings").classList.toggle("open");
   }
 
+  // 把 CFG 当前值回填到已渲染的设置表单（applyUserConfig 合并后调用，保证显示与行为一致）
+  function syncSettingsForm() {
+    const box = document.getElementById("zk-settings");
+    if (!box) return;
+    for (const f of SETTING_FIELDS) {
+      if (f.sec) continue;
+      const row = box.querySelector('.zk-row[data-key="' + f.key + '"]');
+      if (!row) continue;
+      if (f.type === "switch") {
+        const sw = row.querySelector(".zk-switch");
+        if (sw) sw.classList.toggle("on", !!CFG[f.key]);
+      } else if (f.type === "select") {
+        const sel = row.querySelector("select");
+        if (sel) sel.value = String(CFG[f.key]);
+      } else {
+        const inp = row.querySelector("input");
+        if (inp) inp.value = CFG[f.key];
+      }
+    }
+  }
+
   function ensureUI() {
     try {
       ensureStyles();
@@ -1808,8 +1830,10 @@
   window.addEventListener("beforeunload", flushLogs);
   document.addEventListener("click", () => { tryResumeAudio(); pokeDim(); tick(); });
 
+  // 顺序关键：先把你保存的配置合并进 CFG，再渲染 UI——
+  // 否则面板/设置抽屉会用默认值渲染，看起来就像"配置每次刷新都被重置"（v3.16 及之前的真实 bug）
+  applyUserConfig();
   ensureUI();
-  applyUserConfig();       // 用户保存的配置覆盖默认值（store 已就绪，早于首个 tick）
   refreshStatus();         // 应用配置后刷新一次面板显示
   const workerDriver = startWorkerDriver(); // Worker 后台驱动：主线程定时器被冻结时仍尽量推进
   record("INFO", "引擎启动 v" + VERSION + "（后台驱动：" + (workerDriver ? "已启用" : "不可用") + "）");
