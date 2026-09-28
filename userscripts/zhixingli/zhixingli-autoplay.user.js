@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         职行力自动刷课助手
 // @namespace    https://github.com/Lan-zk
-// @version      3.14
-// @description  自动播放和评价职行力课程。面板内置设置抽屉（评语/星级/倍速/超时等即时生效免改代码）；可见性伪装+停滞续播（后台持续推进）；两段式评价；Worker 后台驱动+全量日志+自愈熔断。
+// @version      3.15
+// @description  自动播放和评价职行力课程。多讲课程收尾重设计（播完一讲留在课程页直接下一讲，杜绝"退出确认→重进→重播"循环）；可见性伪装+停滞续播（后台持续推进）；设置抽屉免改代码；全量日志+自愈熔断。
 // @author       Lan-zk
 // @source       https://greasyfork.org/scripts/455353
 // @match        https://u.exexm.com/*
@@ -30,7 +30,7 @@
 (function () {
   "use strict";
 
-  const VERSION = "3.14";
+  const VERSION = "3.15";
   const LOG_MAX = 2500; // 日志最多保留条数（超出丢弃最旧的；抽屉里最多渲染 800 条）
 
   // ===================== 配置 =====================
@@ -277,6 +277,25 @@
   let enterTries = 0;            // 学习卡片点击未跳转的连续次数
   let openTries = 0;             // 课件打开失败的连续次数
   let lastTickAt = now();        // 上一次 tick 的时间（停顿检测用）
+  let waitLearnedSince = 0;      // "等待服务端更新完成状态"的起始时间（超时自愈用）
+
+  // ---------- 防重播护栏（多条） ----------
+  // 多讲课程里播完一讲后，服务端把该讲标记为"已学"可能有延迟；
+  // 记录最近完成的课件标签集合（前 24 字），5 分钟内不重复点击，防止整讲重播。
+  const DONE_TTL = 300000;   // 护栏有效期 5 分钟
+  const DONE_MAX = 10;       // 最多保留条数
+  function markDone(label) {
+    if (!label) return;
+    let arr = store.get("doneMarks", []);
+    if (!Array.isArray(arr)) arr = [];
+    arr = arr.filter((m) => m && now() - m.at < DONE_TTL && m.label !== label);
+    arr.push({ label: label.slice(0, 24), at: now() });
+    store.set("doneMarks", arr.slice(-DONE_MAX));
+  }
+  function isDoneMarked(label) {
+    if (!label) return false;
+    return store.get("doneMarks", []).some((m) => m && m.label === label && now() - m.at < DONE_TTL);
+  }
   const seenMedia = new WeakSet();     // 已挂 ended 监听的媒体元素
   const finishedMedia = new WeakSet(); // 已走完"播完收尾"流程的媒体元素（防重复计数/误退出）
   const progressedMedia = new WeakSet(); // 观测到过播放进度的媒体（用于统计只计真正看过的）
@@ -902,11 +921,14 @@
   }
 
   function dismissPlayerModal() {
+    // 关闭顺序：标题栏返回键 → 播放器左上"关闭"按钮（vjs-close-button，实测部分场景返回键无效）
     let back = $("modal-tc-video-player ion-header button.back-button");
+    if (!back) back = $("modal-tc-video-player .vjs-close-button");
     if (!back) {
       const pc = $(".player-container");
       const root = pc ? pc.closest("ion-modal") : null;
-      if (root) back = root.querySelector("ion-header button.back-button");
+      if (root) back = root.querySelector("ion-header button.back-button") ||
+        root.querySelector(".vjs-close-button");
     }
     if (back) { realClick(back); touch(); record("DBG", "点击返回（关闭播放器弹窗）"); return true; }
     record("DBG", "未找到播放器弹窗返回按钮");
@@ -923,11 +945,15 @@
   }
 
   // 媒体自然播完（事件驱动，后台标签页也能及时触发）
+  // 收尾策略（v3.15 重设计）：播完一讲只关播放器弹窗、**留在课程页**，
+  // 由主循环直接挑选下一讲；只有整门课全部完成（无待学课件且无需评价）才退出课程。
+  // 旧设计"每讲退出→重进"会触发站点的「该课程需要完成学习，是否继续退出」确认框，
+  // 点"是"退出整门课再重进，造成多讲课程反复循环、甚至重播已完成的讲次。
   function onMediaEnded(media) {
     if (!inState("playing")) return; // 防重入：closing 期间忽略重复触发
     if (media) finishedMedia.add(media);
     // 立即记账 + 防重播护栏：不等收尾链跑完（链可能被后台冻结打断，晚记会漏护栏导致重播）
-    if (currentMediaLabel) store.set("lastDone", { label: currentMediaLabel.slice(0, 24), at: now() });
+    markDone(currentMediaLabel);
     if (media && progressedMedia.has(media)) {
       stats.items++;
       store.set("stats", stats);
@@ -940,13 +966,39 @@
     (async () => {
       try {
         if (!inState("closing")) return;
+        // 1. 只关播放器弹窗，回到课程详情页
         dismissPlayerModal();
         if (!(await waitFor(() => !$("modal-tc-video-player"), 2000))) {
           dismissPlayerModal(); // 兜底再点一次
           await waitFor(() => !$("modal-tc-video-player"), 1500);
         }
         if (!inState("closing")) return; // 已被其它流程接管，放弃收尾
-        // 退回学习页：等课程详情页从 DOM 卸载（比"page-learn 存在"可靠——它一直在底层）
+
+        // 2. 稍等列表状态刷新，判断课程内是否还有事可做
+        await sleep(2500);
+        if (!inState("closing")) return;
+        const items = $$(".course-item");
+        const pend = items.filter((el) =>
+          !el.classList.contains("learned") &&
+          !el.classList.contains("exam2_top") &&
+          !el.getAttribute("exepower"));
+        const pendNext = pend.filter((el) => !isDoneMarked(normText(el.innerText).slice(0, 24)));
+        const needEval = items.some((el) =>
+          el.classList.contains("exam2_top") && !/已评定/.test(el.innerText || ""));
+
+        // 3. 还有待学课件（或待评价）：留在课程页，主循环直接选下一个
+        if (pendNext.length || needEval) {
+          record("INFO", "课程内还有 " +
+            (pendNext.length ? pendNext.length + " 个待学课件" : "") +
+            (pendNext.length && needEval ? "和" : "") +
+            (needEval ? "待评价" : "") + "，留在课程页继续");
+          setState("idle");
+          clearLock();
+          return;
+        }
+
+        // 4. 整门课全部完成（剩余课件均处于护栏期视为已完成）才退出课程。
+        //    此时退出不会触发「是否继续退出」确认框；万一弹出，handleAlerts 兜底。
         goBackFromCourse();
         let backOk = await waitFor(() => !$("course-detail-page"), 2500);
         if (!inState("closing")) return;
@@ -1246,12 +1298,9 @@
       !el.getAttribute("exepower");
     const pending = items.filter(isPending);
 
-    // 防重播护栏：刚播完的课件若尚未被服务端标记"已学"，90 秒内不再点它（避免整节重播）
-    // 用前 24 字前缀匹配，容忍站点在条目文字上追加角标
-    const ld = store.get("lastDone", null);
-    const recentlyDone = (el) =>
-      !!(ld && now() - ld.at < 90000 && normText(el.innerText).slice(0, 24) === ld.label);
-    const candidates = pending.filter((el) => !recentlyDone(el));
+    // 防重播护栏（多条，5 分钟有效）：刚播完的课件若尚未被服务端标记"已学"，不再点它
+    // 用前 24 字前缀匹配，容忍站点在条目文字上追加"进度:xx%"等角标
+    const candidates = pending.filter((el) => !isDoneMarked(normText(el.innerText).slice(0, 24)));
 
     // 跳过无法识别类型的课件（如图文），继续找下一个可处理的，避免堵死列表
     const target = candidates.find((el) => /文档课件|音频|视频/.test(el.innerText || ""));
@@ -1279,12 +1328,19 @@
     }
 
     if (!candidates.length && pending.length) {
-      // 只剩"刚完成但还没被标已学"的课件：等状态刷新，避免整节重播
-      noteOnce("wait-learned", "等待服务端更新完成状态" +
-        (ld ? "（刚完成：" + ld.label + "）" : ""));
-      setStatus("等待课时状态刷新…", "");
+      // 只剩"刚完成但还没被标已学"的课件：等状态刷新，避免整节重播。
+      // 若等太久（90s）说明服务端标记卡住，刷新页面强制同步（走熔断保护）。
+      if (!waitLearnedSince) waitLearnedSince = now();
+      noteOnce("wait-learned", "等待服务端更新完成状态（" +
+        Math.round((now() - waitLearnedSince) / 1000) + "s）");
+      setStatus("等待课时状态刷新…", Math.round((now() - waitLearnedSince) / 1000) + "s");
+      if (now() - waitLearnedSince > 90000) {
+        waitLearnedSince = 0;
+        doReload("等待服务端更新完成状态超时（90s）");
+      }
       return;
     }
+    waitLearnedSince = 0;
     if (candidates.length) {
       const first = candidates[0];
       noteOnce("unknown-" + normText(first.innerText).slice(0, 24),
