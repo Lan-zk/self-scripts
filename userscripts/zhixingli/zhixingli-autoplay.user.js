@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         职行力自动刷课助手
 // @namespace    https://github.com/Lan-zk
-// @version      3.21
-// @description  自动播放和评价职行力课程。克制的辅助仪器界面；多讲课程收尾防循环；后台持续推进（Worker 驱动/可见性+失焦伪装/可选主动画中画）；面板内设置与全量日志。
+// @version      3.22
+// @description  自动播放和评价职行力课程。克制的辅助仪器界面；自适应倍速防缓冲耗尽；后台持续推进（Worker 驱动/可见性+失焦伪装）；手动画中画；面板内设置与全量日志。
 // @author       Lan-zk
 // @source       https://greasyfork.org/scripts/455353
 // @match        https://u.exexm.com/*
@@ -20,7 +20,8 @@
  * 3. 自动刷新带熔断器：10 分钟内最多 3 次，防止"刷新→又立刻刷新"死循环。
  * 4. 弹窗治理：堆叠的 ion-modal 自动清理；系统确认框按升级阶梯处理；奖励弹窗自动关闭。
  * 5. 后台运行：Web Worker 驱动 + 静音音频防节流 + 可见性/失焦伪装 + 停滞自动续播
- *    + 可选画中画（主动保活：后台即进小窗、回前台退出；或停滞兜底）。
+ *    + 自适应倍速（缓冲耗尽自动降档、稳定后逐档升回）。画中画为面板手动按钮：
+ *    Chrome 要求 PiP 在真实点击手势内发起，脚本自动调用必被拒（日志实锤过）。
  * 6. 日志与设置：均收敛在主面板内展开；全量动作/状态快照落盘（跨刷新保留），
  *    "复制排查信息"一键导出完整报告；设置即时生效并持久化，免改代码。
  *
@@ -31,14 +32,14 @@
 (function () {
   "use strict";
 
-  const VERSION = "3.21";
+  const VERSION = "3.22";
   const LOG_MAX = 2500; // 日志最多保留条数（超出丢弃最旧的；抽屉里最多渲染 800 条）
 
   // ===================== 配置 =====================
   const CFG = {
     interval: 1000,            // 轮询间隔（毫秒）。全部步骤为条件轮询，小间隔=衔接更快
     muted: true,               // 自动静音视频/音频（也用于刷新后恢复自动播放）
-    playbackRate: 0,           // 0=不干预倍速；设为 2/3/4 会强制设定（自行评估账号风控风险）
+    playbackRate: 0,           // 0=不干预倍速；设为 2/3/4… 强制设定，供流不足时自动降档、稳定后升回（风控自行评估）
     stars: 5,                  // 评价星级（1~5）
     comment: "",  // 评价评语
     commentFallback: "很好，讲的不错", // comment 为空且首次保存失败时，重试用该评语
@@ -47,8 +48,6 @@
     stuckOpenSec: 45,          // 打开课件/弹窗多久没出现视为卡死（秒）
     stuckPlayingSec: 180,      // 播放中多久无进度视为卡死（秒）
     stallResumeSec: 15,        // 播放中进度停滞多久就自动续播（秒；细粒度，专门对付后台暂停）
-    pipFallback: false,        // true=进度停滞时才让视频进画中画小窗兜底（会弹出小窗；默认关）
-    pipOnHide: false,          // true=页面一进后台就主动进画中画小窗（小窗持续渲染且豁免标签页冻结，后台推进最彻底）；回前台自动退出
     noProgressMin: 12,         // 整体多久无任何进展就自愈刷新（分钟）
     reloadAfterHours: 3,       // 连续运行该时长后，择机（回到学习页空档）刷新释放内存；0=关闭
     heapLimitMB: 2000,         // JS 堆超过该 MB 数择机刷新（仅 Chrome 可感知；0=关闭）
@@ -71,7 +70,7 @@
   // 不能在这里立即执行——store/CFG 工具尚未就绪，早前版本因此启动即崩。
   const USER_KEYS = [
     "stars", "comment", "commentFallback", "playbackRate", "muted",
-    "alertPolicy", "pipFallback", "pipOnHide", "spoofFocus", "antiThrottle", "debug",
+    "alertPolicy", "spoofFocus", "antiThrottle", "debug",
     "stuckOpenSec", "stuckPlayingSec", "stallResumeSec", "noProgressMin",
     "reloadAfterHours", "heapLimitMB", "toastLevel", "autoDim",
   ];
@@ -584,6 +583,7 @@
       '<button class="zk-btn zk-ghost" id="zk-copybtn" style="flex:1">复制</button>' +
       '<button class="zk-btn zk-ghost" id="zk-setbtn" style="flex:1">设置</button>' +
       '<button class="zk-btn zk-ghost" id="zk-logbtn" style="flex:1">日志<span id="zk-logbadge" hidden></span></button>' +
+      '<button class="zk-btn zk-ghost" id="zk-pipbtn" style="flex:1" title="手动进画中画（Chrome 要求真实点击手势；每讲需点一次）">画中画</button>' +
       "</div>" +
       '<div class="zk-status">待命</div>' +
       '<div class="zk-sub"></div>' +
@@ -635,6 +635,9 @@
       b.contentEditable = b.contentEditable === "true" ? "false" : "true";
       copyBtn.textContent = b.contentEditable === "true" ? "已可复制" : "复制";
     };
+
+    // 手动画中画：点击=真实手势，Chrome 才允许 PiP（自动调用必被拒）；再点一次=退出
+    panel.querySelector("#zk-pipbtn").onclick = () => enterPipManual();
 
     panel.querySelector("#zk-setbtn").onclick = () => {
       if (toggleView("set")) syncSettingsForm();
@@ -951,6 +954,9 @@
     try {
       try { document.hasFocus = () => true; } catch (e) {}
       window.addEventListener("blur", (e) => {
+        // 只处理"窗口级"失焦：capture 挂在 window 上会看到页面里所有元素的 blur，
+        // 元素级 blur 必须放行（站点的输入框/表单逻辑依赖它），也不为它补发合成 focus
+        if (e.target !== window) return;
         try { if (e.isTrusted) e.stopImmediatePropagation(); } catch (er) {}
         if (running) {
           // 用微任务补发（不被后台定时器节流）；站点已跑过的 blur 监听会看到"紧接着又获焦"
@@ -966,44 +972,29 @@
     }
   }
 
-  // ---------- 画中画：主动保活与停滞兜底共用一个入口 ----------
-  // 主动模式（pipOnHide）：页面一进后台立即把视频切进 PiP 小窗——小窗持续渲染且豁免
-  //   标签页冻结，是后台推进最彻底的手段；回到前台自动退出。切换课件会自动重进。
-  // 兜底模式（pipFallback）：进度停滞时才进 PiP（原行为，不自动退出）。
-  let pipActive = false;   // 兜底模式已进入
-  let pipAuto = false;     // 主动模式已进入（回前台时要自动退出）
-  let lastPipTryAt = 0;    // 进入尝试冷却：被拒绝后 30s 内不重试，避免每拍刷日志
-  async function enterPip(media, why) {
-    try {
-      if (!media || !media.requestPictureInPicture) return false;
-      if (document.pictureInPictureElement) return false;
-      if (now() - lastPipTryAt < 30000) return false;
-      lastPipTryAt = now();
-      await media.requestPictureInPicture();
-      record("INFO", "已进入画中画（" + why + "）");
-      return true;
-    } catch (e) {
-      record("DBG", "画中画进入失败：" + String((e && e.message) || e).slice(0, 80));
-      return false;
+  // ---------- 手动画中画 ----------
+  // Chrome 要求 requestPictureInPicture 在真实点击手势内发起，脚本自动调用必被拒
+  // （v3.21 日志实锤："Must be handling a user gesture"），故不提供自动进入，只留面板手动按钮：
+  // 播放中点击"画中画"= 真实手势，小窗持续渲染且豁免标签页冻结，最小化页面也能继续刷。
+  // 注意：每讲视频是全新元素，PiP 不会自动跟随，换讲后需再点一次。
+  async function enterPipManual() {
+    const media = playingMedia();
+    if (!media || media.tagName !== "VIDEO" || !media.requestPictureInPicture) {
+      notify("当前没有可进画中画的视频（播放中再点）", "warn");
+      return;
     }
-  }
-  async function maybePiP(media) {
-    if (!CFG.pipFallback || pipActive || pipAuto) return;
-    if (await enterPip(media, "后台停滞兜底")) pipActive = true;
-  }
-  // 主动模式：后台即进、回前台即退（manageMedia 每拍调用；内部有冷却与状态判断）
-  async function pipHideCheck(media) {
-    if (!CFG.pipOnHide) return;
-    if (pageHiddenReal()) {
-      if (media && media.tagName === "VIDEO" && !document.pictureInPictureElement) {
-        if (await enterPip(media, "页面进入后台，主动保活")) pipAuto = true;
-      }
-    } else if (pipAuto && document.pictureInPictureElement) {
-      pipAuto = false;
-      try {
+    try {
+      if (document.pictureInPictureElement) {
         await document.exitPictureInPicture();
-        record("INFO", "已退出画中画（回到前台）");
-      } catch (e) {}
+        notify("已退出画中画", "ok");
+        return;
+      }
+      await media.requestPictureInPicture();
+      record("INFO", "手动进入画中画（真实点击手势，Chrome 允许）");
+      notify("已进入画中画，可最小化页面继续刷", "ok");
+    } catch (e) {
+      notify("画中画失败：" + String((e && e.message) || e).slice(0, 50), "error");
+      record("WARN", "手动画中画失败：" + ((e && e.message) || e));
     }
   }
   // 主线程的 setTimeout/setInterval 在后台标签页会降到 1 次/分钟甚至完全冻结；
@@ -1295,15 +1286,80 @@
     })();
   }
 
+  // ---------- 自适应倍速：供流跟不上时自动降档，稳定后逐档升回 ----------
+  // 高倍速消耗带宽是 1x 的 N 倍，CDN 供不上时视频会"paused=false 但时间轴冻结"（缓冲耗尽），
+  // play() 救不回。档位梯子 = 目标倍速逐级减半（16→8→4→2→1）；降档后稳定 60s 才试探升一档，
+  // 升档后 60s 内再停滞则退回并把该档锁为本讲上限（防 16↔8 来回震荡）。换课件全部重来。
+  let rateIdx = 0;          // 当前档位索引（0=目标倍速，越大越慢）
+  let rateCeilIdx = 0;      // 实测上限索引：升档不得越过（索引越小速度越快）
+  let rateLastChangeAt = 0; // 最近一次调档时间（任何调档后 60s 内不再调）
+  let rateTrialFromIdx = -1;// 升档试验的原档位（观察期内停滞→退回并锁定上限）
+  function rateLadder() {
+    const s = [];
+    for (let r = Math.max(1, Math.round(CFG.playbackRate)); r >= 1; r = Math.floor(r / 2)) s.push(r);
+    return s;
+  }
+  function effRateIdx() {
+    const lad = rateLadder();
+    const ceil = Math.min(rateCeilIdx, lad.length - 1);
+    return Math.min(Math.max(rateIdx, ceil), lad.length - 1);
+  }
+  function currentRate() { return rateLadder()[effRateIdx()] || 1; }
+  function rateResetForMedia() { rateIdx = 0; rateCeilIdx = 0; rateLastChangeAt = 0; rateTrialFromIdx = -1; }
+  function setRate(media, idx) {
+    rateIdx = idx;
+    rateLastChangeAt = now();
+    const r = rateLadder()[idx] || 1;
+    try { media.playbackRate = r; } catch (e) {}
+    return r;
+  }
+  function rateOnStall(media) {
+    const lad = rateLadder();
+    // 升档观察期内停滞：退回原档并锁为本讲上限
+    if (rateTrialFromIdx >= 0 && now() - rateLastChangeAt < 60000) {
+      const r = setRate(media, rateTrialFromIdx);
+      rateCeilIdx = rateTrialFromIdx;
+      rateTrialFromIdx = -1;
+      record("WARN", "升档后仍供流不足，退回 " + r + "x 并锁为本讲上限");
+      return;
+    }
+    const cur = effRateIdx();
+    if (cur >= lad.length - 1) return; // 已最低档（1x），交给看门狗
+    const r = setRate(media, cur + 1);
+    record("WARN", "倍速降档 → " + r + "x（缓冲耗尽，供流跟不上 " + lad[cur] + "x）");
+  }
+  function rateMaybeUpshift(media) {
+    const lad = rateLadder();
+    const cur = effRateIdx();
+    if (cur === 0 || cur <= rateCeilIdx) return; // 已到目标倍速 / 已到实测上限
+    if (now() - rateLastChangeAt < 60000) return; // 调档后稳定 60s 才试探升档
+    rateTrialFromIdx = cur;
+    const r = setRate(media, cur - 1);
+    record("INFO", "倍速升档 → " + r + "x（已稳定 60s，试探恢复；60s 内再停滞将退回 " + lad[cur] + "x）");
+  }
+  // 缓冲前瞻：当前播放点到已缓冲末尾的秒数（-1=未知）
+  function bufferedAhead(media) {
+    try {
+      const cur = media.currentTime || 0;
+      for (let i = 0; i < media.buffered.length; i++) {
+        if (cur >= media.buffered.start(i) - 0.5 && cur <= media.buffered.end(i) + 0.5) {
+          return Math.max(0, media.buffered.end(i) - cur);
+        }
+      }
+    } catch (e) {}
+    return -1;
+  }
+
   function manageMedia(media) {
     if (finishedMedia.has(media)) return; // 已收尾的残留媒体，等待 DOM 移除即可
     if (CFG.muted) media.muted = true;
-    if (CFG.playbackRate > 0 && media.playbackRate !== CFG.playbackRate) {
-      try { media.playbackRate = CFG.playbackRate; } catch (e) {}
+    if (CFG.playbackRate > 0 && media.playbackRate !== currentRate()) {
+      try { media.playbackRate = currentRate(); } catch (e) {}
     }
 
     if (!seenMedia.has(media)) {
       seenMedia.add(media);
+      rateResetForMedia(); // 新课件：倍速降档/上限状态重新开始
       lastMediaTime = -1;
       lastMediaProgressAt = now();
       lastProgressLogAt = now();
@@ -1345,29 +1401,41 @@
       lastMediaProgressAt = now();
       progressedMedia.add(media); // 观测到推进：完成统计时才算"真正看过"
       touch();
+      if (CFG.playbackRate > 1) {
+        if (rateTrialFromIdx >= 0 && now() - rateLastChangeAt >= 60000) rateTrialFromIdx = -1; // 升档观察期通过
+        rateMaybeUpshift(media);
+      }
     }
     setState("playing");
     refreshStatus();
-    pipHideCheck(media); // 主动画中画：后台即进、回前台即退（异步每拍检查，内部有冷却）
 
     // 细粒度停滞续播：后台/最小化时播放器可能暂停推进。
     // 与 180s 看门狗不同层：这里 15s 一查，停了就 play() 拉起（必要时换播放器大按钮）。
     if (!media.paused && progressedMedia.has(media) &&
         now() - lastMediaProgressAt > CFG.stallResumeSec * 1000) {
-      record("WARN", "进度停滞 " + CFG.stallResumeSec + "s（疑似后台自动暂停），自动续播");
+      const ahead = bufferedAhead(media);
+      record("WARN", "进度停滞 " + CFG.stallResumeSec + "s，自动续播｜paused=" + media.paused +
+        " readyState=" + media.readyState +
+        (ahead >= 0 ? " 缓冲前瞻=" + ahead.toFixed(1) + "s" : "") +
+        (ahead === 0 ? "（缓冲已耗尽：供流跟不上倍速）" : ""));
       const p = media.play();
       if (p && p.catch) p.catch(() => {});
       const big = $(".vjs-big-play-button");
       if (big) realClick(big);
       lastMediaProgressAt = now() - (CFG.stallResumeSec * 500); // 给恢复半程观察窗
-      maybePiP(media); // 连续停滞时可选进入画中画兜底
+      // 供流不足（缓冲见底）→ 降档；缓冲充足却冻结（后台挂起类）降档无益，不降
+      if (CFG.playbackRate > 1 && ((ahead >= 0 && ahead < 2) || (ahead < 0 && !pageHiddenReal()))) {
+        rateOnStall(media);
+      }
     }
 
     // 播放进度日志（每 60s）：证明播放持续推进、速度与暂停状态一目了然
     if (now() - lastProgressLogAt > 60000) {
       lastProgressLogAt = now();
+      const bufS = bufferedAhead(media);
       record("DBG", "播放进度 " + fmtClock(cur) + "/" + fmtClock(media.duration) +
-        " ×" + media.playbackRate + (media.paused ? "（暂停中）" : ""));
+        " ×" + media.playbackRate + (media.paused ? "（暂停中）" : "") +
+        (bufS >= 0 ? " 缓冲=" + bufS.toFixed(0) + "s" : ""));
     }
 
     // 播放卡死检测：长时间无进度 → 大播放键恢复 → 仍不行则刷新
@@ -1902,10 +1970,8 @@
     { key: "comment", type: "text", label: "评价评语", tip: "留空=不填评语" },
     { key: "commentFallback", type: "text", label: "重试评语", tip: "首次保存失败后重试时使用" },
     { sec: "播放" },
-    { key: "playbackRate", type: "number", min: 0, max: 16, step: 1, label: "强制倍速", tip: "0=不干预（用播放器自己的设置）" },
+    { key: "playbackRate", type: "number", min: 0, max: 16, step: 1, label: "强制倍速", tip: "0=不干预；供流不足时自动降档" },
     { key: "muted", type: "switch", label: "自动静音", tip: "关闭会有声音" },
-    { key: "pipOnHide", type: "switch", label: "主动画中画", tip: "切到后台立即进小窗保活，回前台自动退出" },
-    { key: "pipFallback", type: "switch", label: "画中画兜底", tip: "后台停滞时才进画中画小窗" },
     { sec: "自动化" },
     { key: "alertPolicy", type: "select", label: "确认框处理", tip: "系统弹窗点哪个按钮",
       options: [["last", "点最后一个（确定类）"], ["cancel", "点取消类"], ["", "不处理（手动）"]] },
