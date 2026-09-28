@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         职行力自动刷课助手
 // @namespace    https://github.com/Lan-zk
-// @version      3.15
-// @description  自动播放和评价职行力课程。多讲课程收尾重设计（播完一讲留在课程页直接下一讲，杜绝"退出确认→重进→重播"循环）；可见性伪装+停滞续播（后台持续推进）；设置抽屉免改代码；全量日志+自愈熔断。
+// @version      3.16
+// @description  自动播放和评价职行力课程。克制的辅助仪器界面（闲置淡化/可折叠微标/提示分级静默）；多讲课程收尾防循环；后台持续推进；设置抽屉免改代码；全量日志。
 // @author       Lan-zk
 // @source       https://greasyfork.org/scripts/455353
 // @match        https://u.exexm.com/*
@@ -21,7 +21,7 @@
  * 4. 弹窗治理：堆叠的 ion-modal 自动清理；系统确认框按升级阶梯处理；奖励弹窗自动关闭。
  * 5. 后台运行：Web Worker 驱动 + 静音音频防节流 + 可见性伪装 + 停滞自动续播。
  * 6. 日志抽屉：全量动作/状态快照落盘（跨刷新保留），右侧"日志"入口打开，
- *    "复制排查信息"一键导出完整报告；"⚙ 设置"抽屉动态调整参数，免改代码。
+ *    "复制排查信息"一键导出完整报告；"设置"抽屉动态调整参数，免改代码。
  *
  * 致谢：基于 misaka10032w 的「职行力视频自动播放」(greasyfork #455353) 重写，
  * 原版仅保留课程分发思路；其余（状态机/弹窗治理/日志/设置/后台对抗）均为重构。
@@ -55,6 +55,10 @@
     antiThrottle: true,        // 挂后台时防止定时器被 Chrome 节流（静音音频，无声音）
     spoofVisibility: true,     // 伪装页面"始终可见"：阻止播放器在后台/最小化时自动暂停（本脚本核心诉求）
     debug: false,              // true=额外在控制台实时输出（页面日志始终全量记录；DevTools 开着时控制台输出更卡，故默认关）
+
+    // ---- 界面（辅助性：可淡化、可折叠、提示可静默） ----
+    toastLevel: "all",         // 提示级别："all"=全部 / "warn"=仅异常警告 / "off"=静默（始终记日志）
+    autoDim: true,             // 面板闲置 8 秒后自动淡化，鼠标移过即恢复
   };
   // ================================================
 
@@ -66,7 +70,7 @@
     "stars", "comment", "commentFallback", "playbackRate", "muted",
     "alertPolicy", "pipFallback", "antiThrottle", "debug",
     "stuckOpenSec", "stuckPlayingSec", "stallResumeSec", "noProgressMin",
-    "reloadAfterHours", "heapLimitMB",
+    "reloadAfterHours", "heapLimitMB", "toastLevel", "autoDim",
   ];
   function applyUserConfig() {
     const saved = store.get("cfg", {});
@@ -219,12 +223,20 @@
     } catch (er) { /* 日志通道绝不能抛错 */ }
   }
 
-  // ---------- 顶部 Toast（只弹脚本自身的关键信息，页面自身错误不弹） ----------
+  // ---------- 右上角提示（辅助性耳语：小、半透明、可按级别静默；日志始终全量） ----------
   let toastBox = null;
   const toastSeen = new Map(); // 同文本 20 秒内去重，避免刷屏
+  const LVL_RANK = { info: 0, ok: 0, warn: 1, error: 2, fatal: 3 };
+  function toastAllowed(level) {
+    if ((LVL_RANK[level] || 0) >= 3) return true;      // 熔断等致命信息始终提醒
+    if (CFG.toastLevel === "off") return false;
+    if (CFG.toastLevel === "warn") return (LVL_RANK[level] || 0) >= 1;
+    return true;
+  }
   function notify(msg, level) {
     record(level === "ok" ? "OK" : String(level || "info").toUpperCase(), msg);
     try {
+      if (!toastAllowed(level)) return;
       if (!toastBox) {
         toastBox = document.createElement("div");
         toastBox.id = "zk-toasts";
@@ -237,13 +249,16 @@
 
       const el = document.createElement("div");
       el.className = "zk-toast " + (level || "info");
-      el.textContent = msg;
+      el.innerHTML = '<span class="zk-tdot"></span>';
+      el.appendChild(document.createTextNode(msg));
       toastBox.appendChild(el);
       while (toastBox.children.length > 3) toastBox.removeChild(toastBox.firstChild);
-      // fatal 常驻不自动消失，其余超时移除
+      // fatal 常驻不自动消失，其余安静淡出
       if (level !== "fatal") {
-        setTimeout(() => { if (el.parentNode) el.parentNode.removeChild(el); },
-          level === "error" ? 8000 : 5000);
+        setTimeout(() => {
+          el.classList.add("zk-out");
+          setTimeout(() => { if (el.parentNode) el.parentNode.removeChild(el); }, 400);
+        }, level === "error" ? 7000 : 4200);
       }
     } catch (e) { /* 提示通道绝不能抛错 */ }
   }
@@ -356,86 +371,126 @@
   }
 
   // ---------- 样式注入 ----------
+  // 设计取向：辅助仪器层。低饱和中性色 + 单一弱绿（运行）+ 弱红（故障）；
+  // 闲置自动淡化、可折叠为微标、提示为右上角耳语——插件不与页面争夺注意力。
   function ensureStyles() {
     if (document.getElementById("zk-style")) return;
     const st = document.createElement("style");
     st.id = "zk-style";
     st.textContent = [
-      "#zk-panel{position:fixed;right:16px;bottom:16px;z-index:99999;width:176px;display:flex;flex-direction:column;font-family:'Segoe UI',system-ui,sans-serif}",
-      "#zk-panel .zk-card{background:rgba(30,32,38,.93);backdrop-filter:blur(10px);border:1px solid rgba(255,255,255,.08);border-radius:14px;padding:10px;box-shadow:0 10px 30px rgba(0,0,0,.35);display:flex;flex-direction:column;gap:8px}",
-      "#zk-panel .zk-title{display:flex;justify-content:space-between;align-items:center;color:#e8eaed;font-size:12px;font-weight:600;letter-spacing:.5px}",
-      "#zk-panel .zk-ver{color:#8ab4f8;font-size:10px;font-weight:400}",
-      ".zk-btn{border:none;border-radius:9px;cursor:pointer;color:#fff;font-weight:600;font-family:inherit;transition:filter .15s ease,transform .06s ease}",
-      ".zk-btn:hover{filter:brightness(1.15)}",
-      ".zk-btn:active{transform:scale(.97)}",
-      ".zk-primary{width:100%;height:38px;font-size:14px;background:linear-gradient(135deg,#26b565,#1e8e3e);box-shadow:0 3px 10px rgba(30,142,62,.4)}",
-      ".zk-primary.on{background:linear-gradient(135deg,#ea5a5a,#d93025);box-shadow:0 3px 10px rgba(217,48,37,.4)}",
-      ".zk-ghost{width:100%;height:26px;font-size:12px;font-weight:500;background:rgba(255,255,255,.1);color:#dadce0}",
-      ".zk-ghost:hover{background:rgba(255,255,255,.18)}",
-      ".zk-status{color:#e8eaed;font-size:12px;font-weight:600;padding:1px 3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
-      ".zk-sub{color:#9aa0a6;font-size:10.5px;padding:0 3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
-      "#zk-toasts{position:fixed;top:14px;left:50%;transform:translateX(-50%);z-index:100000;display:flex;flex-direction:column;gap:8px;max-width:76vw;pointer-events:none;font-family:'Segoe UI',system-ui,sans-serif}",
-      ".zk-toast{padding:9px 16px;border-radius:10px;color:#fff;font-size:13px;box-shadow:0 6px 20px rgba(0,0,0,.35);border-left:4px solid;word-break:break-all;animation:zk-in .25s ease}",
-      ".zk-toast.info{background:rgba(50,53,60,.95);border-color:#9aa0a6}",
-      ".zk-toast.ok{background:rgba(23,98,55,.95);border-color:#5bbd82}",
-      ".zk-toast.warn{background:rgba(158,95,10,.95);border-color:#ffb84d}",
-      ".zk-toast.error{background:rgba(156,32,26,.95);border-color:#ff6d5e}",
-      ".zk-toast.fatal{background:rgba(156,32,26,.97);border-color:#fff;font-weight:700}",
-      "@keyframes zk-in{from{opacity:0;transform:translateY(-10px)}to{opacity:1;transform:none}}",
-      "#zk-dock{position:fixed;right:0;top:50%;transform:translateY(-50%);z-index:100001;background:rgba(30,32,38,.93);color:#e8eaed;border:1px solid rgba(255,255,255,.1);border-right:none;border-radius:10px 0 0 10px;padding:14px 7px;font-size:12px;writing-mode:vertical-rl;letter-spacing:3px;cursor:pointer;font-family:'Segoe UI',system-ui,sans-serif;box-shadow:-4px 4px 14px rgba(0,0,0,.25);user-select:none}",
-      "#zk-dock:hover{filter:brightness(1.25)}",
-      "#zk-badge{position:absolute;top:-6px;left:-7px;background:#d93025;color:#fff;border-radius:9px;font-size:10px;min-width:16px;height:16px;line-height:16px;text-align:center;writing-mode:horizontal-tb;letter-spacing:0;padding:0 4px;font-weight:700}",
-      "#zk-drawer{position:fixed;top:0;right:0;bottom:0;width:340px;max-width:90vw;background:rgba(22,24,29,.98);border-left:1px solid rgba(255,255,255,.1);z-index:100002;display:flex;flex-direction:column;font-family:'Segoe UI',system-ui,sans-serif;transform:translateX(100%);transition:transform .25s ease;pointer-events:none;box-shadow:-10px 0 40px rgba(0,0,0,.4)}",
-      "#zk-drawer.open{transform:none;pointer-events:auto}",
-      "#zk-drawer .zk-dh{display:flex;align-items:center;gap:6px;padding:10px 12px;border-bottom:1px solid rgba(255,255,255,.08);color:#e8eaed;font-size:13px;font-weight:600}",
-      "#zk-drawer .zk-grow{flex:1}",
-      "#zk-drawer .zk-mini{background:rgba(255,255,255,.1);border:none;color:#dadce0;border-radius:6px;padding:4px 10px;font-size:11px;cursor:pointer;font-family:inherit;white-space:nowrap}",
-      "#zk-drawer .zk-mini:hover{background:rgba(255,255,255,.2)}",
-      "#zk-drawer .zk-mini.accent{background:#2d6cdf}",
-      "#zk-drawer .zk-mini.accent:hover{background:#3d7df0}",
+      // ---- 面板 ----
+      "#zk-panel{position:fixed;right:14px;bottom:14px;z-index:99999;width:156px;display:flex;flex-direction:column;align-items:flex-end;font-family:'Segoe UI',system-ui,sans-serif}",
+      "#zk-panel .zk-card{width:100%;box-sizing:border-box;background:rgba(26,28,32,.86);backdrop-filter:blur(8px);border:1px solid rgba(255,255,255,.07);border-radius:12px;padding:9px;box-shadow:0 8px 24px rgba(0,0,0,.28);display:flex;flex-direction:column;gap:7px;transition:opacity .5s ease}",
+      "#zk-panel .zk-title{display:flex;align-items:center;gap:5px;color:#c9cdd3;font-size:11px;font-weight:500}",
+      "#zk-panel .zk-name{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
+      "#zk-panel .zk-ver{color:#6b7075;font-size:9.5px;font-weight:400}",
+      "#zk-panel .zk-fold{flex:none;width:16px;height:16px;border:none;border-radius:5px;background:transparent;color:#8b9096;font-size:12px;line-height:1;cursor:pointer;padding:0}",
+      "#zk-panel .zk-fold:hover{background:rgba(255,255,255,.08);color:#e8eaed}",
+      ".zk-dot{flex:none;width:7px;height:7px;border-radius:50%;background:#6b7075;transition:background .4s ease}",
+      // 折叠后的微标
+      "#zk-panel .zk-pill{display:none;align-items:center;gap:6px;height:24px;padding:0 10px;border-radius:12px;background:rgba(26,28,32,.86);backdrop-filter:blur(8px);border:1px solid rgba(255,255,255,.07);cursor:pointer;font-size:11px;color:#bdc1c6;box-shadow:0 4px 14px rgba(0,0,0,.22);transition:opacity .5s ease;user-select:none}",
+      "#zk-panel .zk-pill:hover{color:#e8eaed}",
+      "#zk-panel.zk-collapsed .zk-card{display:none}",
+      "#zk-panel.zk-collapsed .zk-pill{display:flex}",
+      // 闲置淡化（辅助性核心：不 attended 时退到背景）
+      "#zk-panel.zk-dim .zk-card,#zk-panel.zk-dim .zk-pill{opacity:.34}",
+      "#zk-panel .zk-card:hover,#zk-panel .zk-pill:hover{opacity:1}",
+      // ---- 按钮 ----
+      ".zk-btn{border:none;border-radius:7px;cursor:pointer;font-family:inherit;transition:background .15s ease,transform .06s ease}",
+      ".zk-btn:hover{background:rgba(255,255,255,.14)!important}",
+      ".zk-btn:active{transform:scale(.98)}",
+      ".zk-primary{width:100%;height:31px;font-size:12.5px;font-weight:600;background:#37694e;color:#dfe9e2}",
+      ".zk-primary.on{background:#7a4a42;color:#efe2df}",
+      ".zk-ghost{height:23px;font-size:11px;font-weight:400;background:rgba(255,255,255,.06);color:#bdc1c6}",
+      // ---- 状态 ----
+      ".zk-status{color:#d5d8dc;font-size:11.5px;font-weight:500;padding:0 2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
+      ".zk-sub{color:#8b9096;font-size:10px;padding:0 2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
+      // ---- 提示（右上角耳语） ----
+      "#zk-toasts{position:fixed;top:14px;right:16px;z-index:100000;display:flex;flex-direction:column;align-items:flex-end;gap:6px;max-width:300px;pointer-events:none;font-family:'Segoe UI',system-ui,sans-serif}",
+      ".zk-toast{display:flex;align-items:flex-start;gap:7px;padding:7px 11px;border-radius:9px;font-size:12px;line-height:1.45;color:#d9dbde;background:rgba(28,30,34,.9);border:1px solid rgba(255,255,255,.06);box-shadow:0 6px 18px rgba(0,0,0,.24);word-break:break-all;opacity:.96;transition:opacity .35s ease,transform .35s ease;animation:zk-in .18s ease-out}",
+      ".zk-tdot{flex:none;width:6px;height:6px;border-radius:50%;margin-top:5px;background:#9aa0a6}",
+      ".zk-toast.ok .zk-tdot{background:#4d9e6f}",
+      ".zk-toast.warn .zk-tdot{background:#c9a04a}",
+      ".zk-toast.error .zk-tdot,.zk-toast.fatal .zk-tdot{background:#cf5b50}",
+      ".zk-toast.fatal{color:#f2d7d3;font-weight:600}",
+      ".zk-toast.zk-out{opacity:0;transform:translateY(-4px)}",
+      "@keyframes zk-in{from{opacity:0;transform:translateY(-6px)}to{opacity:1;transform:none}}",
+      // ---- 日志入口（右缘，常淡） ----
+      "#zk-dock{position:fixed;right:0;top:50%;transform:translateY(-50%);z-index:100001;background:rgba(26,28,32,.55);color:#bdc1c6;border:1px solid rgba(255,255,255,.06);border-right:none;border-radius:8px 0 0 8px;padding:12px 5px;font-size:11px;writing-mode:vertical-rl;letter-spacing:3px;cursor:pointer;font-family:'Segoe UI',system-ui,sans-serif;opacity:.55;transition:opacity .3s ease;user-select:none}",
+      "#zk-dock:hover{opacity:1;color:#e8eaed}",
+      "#zk-badge{position:absolute;top:-5px;left:-6px;background:#8c3f38;color:#f2d7d3;border-radius:8px;font-size:9.5px;min-width:15px;height:15px;line-height:15px;text-align:center;writing-mode:horizontal-tb;letter-spacing:0;padding:0 4px}",
+      // ---- 抽屉（日志/设置共用气质） ----
+      "#zk-drawer,#zk-settings{position:fixed;top:0;right:0;bottom:0;width:336px;max-width:90vw;background:rgba(24,26,30,.97);border-left:1px solid rgba(255,255,255,.07);z-index:100002;display:flex;flex-direction:column;font-family:'Segoe UI',system-ui,sans-serif;transform:translateX(100%);transition:transform .22s ease;pointer-events:none;box-shadow:-8px 0 32px rgba(0,0,0,.35)}",
+      "#zk-settings{z-index:100003;max-width:92vw}",
+      "#zk-drawer.open,#zk-settings.open{transform:none;pointer-events:auto}",
+      "#zk-drawer .zk-dh,#zk-settings .zk-dh{display:flex;align-items:center;gap:6px;padding:9px 12px;border-bottom:1px solid rgba(255,255,255,.06);color:#c9cdd3;font-size:12px;font-weight:500}",
+      ".zk-grow{flex:1}",
+      ".zk-mini{background:rgba(255,255,255,.07);border:none;color:#bdc1c6;border-radius:6px;padding:4px 9px;font-size:10.5px;cursor:pointer;font-family:inherit;white-space:nowrap;transition:background .15s ease}",
+      ".zk-mini:hover{background:rgba(255,255,255,.15);color:#e8eaed}",
+      ".zk-mini.accent{background:#46688c;color:#e2e9f0}",
+      ".zk-mini.accent:hover{background:#52779e}",
+      // ---- 日志列表 ----
       "#zk-drawer .zk-list{flex:1;overflow-y:auto;padding:6px 0;user-select:text!important;-webkit-user-select:text!important}",
-      ".zk-line{font-family:Consolas,Menlo,monospace;font-size:11px;line-height:1.5;padding:3px 10px;border-bottom:1px solid rgba(255,255,255,.04);white-space:pre-wrap;word-break:break-all;color:#c9cdd3}",
+      ".zk-line{font-family:Consolas,Menlo,monospace;font-size:11px;line-height:1.5;padding:3px 10px;border-bottom:1px solid rgba(255,255,255,.04);white-space:pre-wrap;word-break:break-all;color:#c1c5ca}",
       ".zk-line .zk-t{color:#5f6368}",
-      ".zk-lv-OK{color:#81c995}.zk-lv-WARN{color:#fdd663}.zk-lv-ERROR{color:#f28b82}.zk-lv-FATAL{color:#ff6d5e;font-weight:700}.zk-lv-PAGE{color:#9aa0a6}.zk-lv-DBG{color:#8ab4f8}.zk-lv-INFO{color:#c9cdd3}",
+      ".zk-lv-OK{color:#7fb99a}.zk-lv-WARN{color:#d0b268}.zk-lv-ERROR{color:#dd8377}.zk-lv-FATAL{color:#e58e85;font-weight:600}.zk-lv-PAGE{color:#8b9096}.zk-lv-DBG{color:#6f8ba3}.zk-lv-INFO{color:#c1c5ca}",
       "#zk-drawer .zk-empty{color:#5f6368;font-size:12px;text-align:center;padding:20px 0}",
       '#zk-loglist.only-err .zk-line[data-lvl="DBG"],#zk-loglist.only-err .zk-line[data-lvl="INFO"],#zk-loglist.only-err .zk-line[data-lvl="OK"],#zk-loglist.only-err .zk-line[data-lvl="PAGE"]{display:none}',
       // ---- 设置抽屉 ----
-      "#zk-settings{position:fixed;top:0;right:0;bottom:0;width:340px;max-width:92vw;background:rgba(22,24,29,.98);border-left:1px solid rgba(255,255,255,.1);z-index:100003;display:flex;flex-direction:column;font-family:'Segoe UI',system-ui,sans-serif;transform:translateX(100%);transition:transform .25s ease;pointer-events:none;box-shadow:-10px 0 40px rgba(0,0,0,.4)}",
-      "#zk-settings.open{transform:none;pointer-events:auto}",
-      "#zk-settings .zk-dh{display:flex;align-items:center;gap:6px;padding:10px 12px;border-bottom:1px solid rgba(255,255,255,.08);color:#e8eaed;font-size:13px;font-weight:600}",
       "#zk-settings .zk-body{flex:1;overflow-y:auto;padding:10px 12px 20px}",
-      "#zk-settings .zk-sec{color:#8ab4f8;font-size:11px;font-weight:700;letter-spacing:1px;margin:14px 0 6px}",
+      "#zk-settings .zk-sec{color:#7d9cb8;font-size:10.5px;font-weight:600;letter-spacing:.8px;margin:14px 0 6px}",
       "#zk-settings .zk-sec:first-child{margin-top:2px}",
       "#zk-settings .zk-row{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:5px 0}",
-      "#zk-settings .zk-lab{color:#c9cdd3;font-size:12.5px;flex:1}",
-      "#zk-settings .zk-lab small{display:block;color:#5f6368;font-size:10.5px;margin-top:1px}",
-      "#zk-settings input[type=text],#zk-settings input[type=number],#zk-settings select{background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.12);color:#e8eaed;border-radius:7px;padding:5px 8px;font-size:12.5px;font-family:inherit;outline:none}",
-      "#zk-settings input[type=text]{width:170px}",
-      "#zk-settings input[type=number]{width:74px;text-align:right}",
-      "#zk-settings input:focus,#zk-settings select:focus{border-color:#8ab4f8}",
-      "#zk-settings .zk-switch{position:relative;width:38px;height:20px;border-radius:10px;background:rgba(255,255,255,.15);border:none;cursor:pointer;transition:background .2s;flex:none}",
-      "#zk-settings .zk-switch::after{content:'';position:absolute;top:2px;left:2px;width:16px;height:16px;border-radius:50%;background:#e8eaed;transition:left .2s}",
-      "#zk-settings .zk-switch.on{background:#26b565}",
-      "#zk-settings .zk-switch.on::after{left:20px}",
-      "#zk-settings .zk-note{color:#5f6368;font-size:10.5px;line-height:1.6;margin-top:10px;border-top:1px solid rgba(255,255,255,.06);padding-top:8px}",
+      "#zk-settings .zk-lab{color:#bdc1c6;font-size:12px;flex:1}",
+      "#zk-settings .zk-lab small{display:block;color:#6b7075;font-size:10px;margin-top:1px}",
+      "#zk-settings input[type=text],#zk-settings input[type=number],#zk-settings select{background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.1);color:#d5d8dc;border-radius:7px;padding:4px 8px;font-size:12px;font-family:inherit;outline:none}",
+      "#zk-settings input[type=text]{width:166px}",
+      "#zk-settings input[type=number]{width:72px;text-align:right}",
+      "#zk-settings input:focus,#zk-settings select:focus{border-color:#7d9cb8}",
+      "#zk-settings .zk-switch{position:relative;width:36px;height:19px;border-radius:10px;background:rgba(255,255,255,.13);border:none;cursor:pointer;transition:background .2s;flex:none}",
+      "#zk-settings .zk-switch::after{content:'';position:absolute;top:2px;left:2px;width:15px;height:15px;border-radius:50%;background:#bdc1c6;transition:left .2s}",
+      "#zk-settings .zk-switch.on{background:#37694e}",
+      "#zk-settings .zk-switch.on::after{left:19px;background:#dfe9e2}",
+      "#zk-settings .zk-note{color:#6b7075;font-size:10px;line-height:1.6;margin-top:10px;border-top:1px solid rgba(255,255,255,.05);padding-top:8px}",
     ].join("\n");
     (document.head || document.documentElement).appendChild(st);
   }
 
   // ---------- 控制面板 ----------
   let panelEls = null;
+  let dimTimer = 0;
+  // 闲置淡化：辅助插件的本分——不被注意时退到背景，鼠标经过即恢复
+  function pokeDim() {
+    const p = document.getElementById("zk-panel");
+    if (!p) return;
+    if (!CFG.autoDim) { p.classList.remove("zk-dim"); return; }
+    p.classList.remove("zk-dim");
+    if (dimTimer) clearTimeout(dimTimer);
+    dimTimer = setTimeout(() => {
+      const q = document.getElementById("zk-panel");
+      if (q && !q.matches(":hover")) q.classList.add("zk-dim");
+    }, 8000);
+  }
+  function setCollapsed(c) {
+    store.set("uiCollapsed", c);
+    const p = document.getElementById("zk-panel");
+    if (p) p.classList.toggle("zk-collapsed", c);
+    pokeDim();
+  }
   function ensurePanel() {
     if ($("#zk-panel")) return;
     ensureStyles();
     const panel = document.createElement("div");
     panel.id = "zk-panel";
     panel.innerHTML =
+      '<div class="zk-pill" title="展开面板"><span class="zk-dot"></span><span>助手</span></div>' +
       '<div class="zk-card">' +
-      '<div class="zk-title"><span>职行力助手</span><span class="zk-ver">v' + VERSION + '</span></div>' +
+      '<div class="zk-title"><span class="zk-dot"></span><span class="zk-name">职行力助手</span>' +
+      '<span class="zk-ver">v' + VERSION + '</span><button class="zk-fold" title="收起到微标">—</button></div>' +
       '<button class="zk-btn zk-primary"></button>' +
       '<div style="display:flex;gap:6px">' +
-      '<button class="zk-btn zk-ghost" style="flex:1">页面可复制</button>' +
-      '<button class="zk-btn zk-ghost" id="zk-setbtn" style="flex:1">⚙ 设置</button>' +
+      '<button class="zk-btn zk-ghost" style="flex:1">复制解锁</button>' +
+      '<button class="zk-btn zk-ghost" id="zk-setbtn" style="flex:1">设置</button>' +
       "</div>" +
       '<div class="zk-status">待命</div>' +
       '<div class="zk-sub"></div>' +
@@ -471,16 +526,26 @@
     copyBtn.onclick = () => {
       const b = document.body;
       b.contentEditable = b.contentEditable === "true" ? "false" : "true";
-      copyBtn.textContent = b.contentEditable === "true" ? "页面可编辑" : "页面可复制";
+      copyBtn.textContent = b.contentEditable === "true" ? "已可复制" : "复制解锁";
     };
 
     panel.querySelector("#zk-setbtn").onclick = toggleSettings;
+    panel.querySelector(".zk-fold").onclick = () => setCollapsed(true);
+    panel.querySelector(".zk-pill").onclick = () => setCollapsed(false);
+    if (store.get("uiCollapsed", false)) panel.classList.add("zk-collapsed");
+    // 淡化交互：鼠标在面板内移动/页面点击都视为"被注意"
+    panel.addEventListener("mousemove", pokeDim);
+    panel.addEventListener("mouseleave", pokeDim);
 
     panelEls = {
       playBtn,
       statusA: panel.querySelector(".zk-status"),
       statusB: panel.querySelector(".zk-sub"),
+      dot: panel.querySelector(".zk-card .zk-dot"),
+      pillDot: panel.querySelector(".zk-pill .zk-dot"),
+      pill: panel.querySelector(".zk-pill"),
     };
+    pokeDim();
     refreshStatus();
   }
 
@@ -488,6 +553,7 @@
     if (panelEls) {
       panelEls.statusA.textContent = main || "";
       panelEls.statusB.textContent = detail || "";
+      panelEls.pill.title = main || "职行力助手"; // 折叠成微标时悬停可见状态
     }
   }
   function refreshStatus() {
@@ -509,6 +575,10 @@
       ? Math.round(performance.memory.usedJSHeapSize / 1048576) + "MB" : "";
     setStatus(main, "已刷 " + stats.items + " 节/" + stats.courses + " 课 · " +
       fmtDur(now() - bootAt) + (mem ? " · " + mem : ""));
+    // 状态点：弱绿=运行，弱红=熔断，灰=停止。颜色只有三种，其余交给文字
+    const dotColor = state === "halt" ? "#cf5b50" : (running ? "#4d9e6f" : "#6b7075");
+    if (panelEls.dot) panelEls.dot.style.background = dotColor;
+    if (panelEls.pillDot) panelEls.pillDot.style.background = dotColor;
   }
 
   // ---------- 日志抽屉（右侧） ----------
@@ -524,7 +594,7 @@
     const drawer = document.createElement("div");
     drawer.id = "zk-drawer";
     drawer.innerHTML =
-      '<div class="zk-dh"><span>📋 运行日志</span><span class="zk-grow"></span>' +
+      '<div class="zk-dh"><span>运行日志</span><span class="zk-grow"></span>' +
       '<button class="zk-mini" id="zk-filter">只看异常</button>' +
       '<button class="zk-mini accent" id="zk-copy">复制排查信息</button>' +
       '<button class="zk-mini" id="zk-clear">清空</button>' +
@@ -1622,6 +1692,10 @@
     { key: "noProgressMin", type: "number", min: 5, max: 60, step: 1, label: "整体无进展自愈", tip: "分钟，超过则刷新重进" },
     { key: "reloadAfterHours", type: "number", min: 0, max: 24, step: 1, label: "定期重置", tip: "小时，0=关闭" },
     { key: "heapLimitMB", type: "number", min: 500, max: 8000, step: 250, label: "内存上限", tip: "MB，超过则择机刷新" },
+    { sec: "界面" },
+    { key: "toastLevel", type: "select", label: "提示级别", tip: "右上角浮动提醒的打扰程度",
+      options: [["all", "全部提示"], ["warn", "仅异常与警告"], ["off", "静默（仅记日志）"]] },
+    { key: "autoDim", type: "switch", label: "面板自动淡化", tip: "闲置 8 秒后降低存在感，移过鼠标恢复" },
     { sec: "调试" },
     { key: "debug", type: "switch", label: "控制台实时输出", tip: "日志抽屉始终全量记录" },
   ];
@@ -1631,7 +1705,7 @@
     ensureStyles();
     const box = document.createElement("div");
     box.id = "zk-settings";
-    let html = '<div class="zk-dh"><span>⚙ 设置</span><span class="zk-grow"></span>' +
+    let html = '<div class="zk-dh"><span>设置</span><span class="zk-grow"></span>' +
       '<button class="zk-mini" id="zk-set-close">关闭</button></div><div class="zk-body">';
     for (const f of SETTING_FIELDS) {
       if (f.sec) { html += '<div class="zk-sec">' + f.sec + "</div>"; continue; }
@@ -1732,7 +1806,7 @@
   window.addEventListener("pageshow", () => tick());
   window.addEventListener("pagehide", flushLogs);
   window.addEventListener("beforeunload", flushLogs);
-  document.addEventListener("click", () => { tryResumeAudio(); tick(); });
+  document.addEventListener("click", () => { tryResumeAudio(); pokeDim(); tick(); });
 
   ensureUI();
   applyUserConfig();       // 用户保存的配置覆盖默认值（store 已就绪，早于首个 tick）
