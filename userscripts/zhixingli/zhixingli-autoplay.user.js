@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         职行力自动刷课助手
 // @namespace    https://github.com/Lan-zk
-// @version      3.17
+// @version      3.18
 // @description  自动播放和评价职行力课程。克制的辅助仪器界面（闲置淡化/可折叠微标/提示分级静默）；多讲课程收尾防循环；后台持续推进；设置抽屉免改代码；全量日志。
 // @author       Lan-zk
 // @source       https://greasyfork.org/scripts/455353
@@ -30,7 +30,7 @@
 (function () {
   "use strict";
 
-  const VERSION = "3.17";
+  const VERSION = "3.18";
   const LOG_MAX = 2500; // 日志最多保留条数（超出丢弃最旧的；抽屉里最多渲染 800 条）
 
   // ===================== 配置 =====================
@@ -416,26 +416,30 @@
       ".zk-toast.fatal{color:#f2d7d3;font-weight:600}",
       ".zk-toast.zk-out{opacity:0;transform:translateY(-4px)}",
       "@keyframes zk-in{from{opacity:0;transform:translateY(-6px)}to{opacity:1;transform:none}}",
-      // ---- 日志入口（右缘，常淡） ----
-      "#zk-dock{position:fixed;right:0;top:50%;transform:translateY(-50%);z-index:100001;background:rgba(26,28,32,.55);color:#bdc1c6;border:1px solid rgba(255,255,255,.06);border-right:none;border-radius:8px 0 0 8px;padding:12px 5px;font-size:11px;writing-mode:vertical-rl;letter-spacing:3px;cursor:pointer;font-family:'Segoe UI',system-ui,sans-serif;opacity:.55;transition:opacity .3s ease;user-select:none}",
-      "#zk-dock:hover{opacity:1;color:#e8eaed}",
-      "#zk-badge{position:absolute;top:-5px;left:-6px;background:#8c3f38;color:#f2d7d3;border-radius:8px;font-size:9.5px;min-width:15px;height:15px;line-height:15px;text-align:center;writing-mode:horizontal-tb;letter-spacing:0;padding:0 4px}",
-      // ---- 抽屉（日志/设置共用气质） ----
-      "#zk-drawer,#zk-settings{position:fixed;top:0;right:0;bottom:0;width:336px;max-width:90vw;background:rgba(24,26,30,.97);border-left:1px solid rgba(255,255,255,.07);z-index:100002;display:flex;flex-direction:column;font-family:'Segoe UI',system-ui,sans-serif;transform:translateX(100%);transition:transform .22s ease;pointer-events:none;box-shadow:-8px 0 32px rgba(0,0,0,.35)}",
-      "#zk-settings{z-index:100003;max-width:92vw}",
-      "#zk-drawer.open,#zk-settings.open{transform:none;pointer-events:auto}",
-      "#zk-drawer .zk-dh,#zk-settings .zk-dh{display:flex;align-items:center;gap:6px;padding:9px 12px;border-bottom:1px solid rgba(255,255,255,.06);color:#c9cdd3;font-size:12px;font-weight:500}",
+      // ---- 面板内日志区（点"日志"展开，面板加宽） ----
+      "#zk-panel{transition:width .18s ease}",
+      "#zk-panel.zk-logopen{width:324px}",
+      "#zk-panel .zk-logsec{display:none;flex-direction:column;gap:5px}",
+      "#zk-panel.zk-logopen .zk-logsec{display:flex}",
+      "#zk-panel .zk-logbar{display:flex;gap:4px}",
+      "#zk-panel .zk-logbar .zk-mini{flex:1;padding:3px 0;font-size:10px;text-align:center}",
+      "#zk-panel .zk-loglist{height:210px;overflow-y:auto;background:rgba(0,0,0,.25);border:1px solid rgba(255,255,255,.05);border-radius:8px;padding:4px 0;user-select:text!important;-webkit-user-select:text!important}",
+      "#zk-logbtn{position:relative}",
+      "#zk-logbadge{position:absolute;top:-5px;right:-4px;background:#8c3f38;color:#f2d7d3;border-radius:8px;font-size:9px;min-width:14px;height:14px;line-height:14px;text-align:center;padding:0 3px;font-weight:600}",
+      // ---- 设置抽屉 ----
+      "#zk-settings{position:fixed;top:0;right:0;bottom:0;width:336px;max-width:92vw;background:rgba(24,26,30,.97);border-left:1px solid rgba(255,255,255,.07);z-index:100003;display:flex;flex-direction:column;font-family:'Segoe UI',system-ui,sans-serif;transform:translateX(100%);transition:transform .22s ease;pointer-events:none;box-shadow:-8px 0 32px rgba(0,0,0,.35)}",
+      "#zk-settings.open{transform:none;pointer-events:auto}",
+      "#zk-settings .zk-dh{display:flex;align-items:center;gap:6px;padding:9px 12px;border-bottom:1px solid rgba(255,255,255,.06);color:#c9cdd3;font-size:12px;font-weight:500}",
       ".zk-grow{flex:1}",
       ".zk-mini{background:rgba(255,255,255,.07);border:none;color:#bdc1c6;border-radius:6px;padding:4px 9px;font-size:10.5px;cursor:pointer;font-family:inherit;white-space:nowrap;transition:background .15s ease}",
       ".zk-mini:hover{background:rgba(255,255,255,.15);color:#e8eaed}",
       ".zk-mini.accent{background:#46688c;color:#e2e9f0}",
       ".zk-mini.accent:hover{background:#52779e}",
-      // ---- 日志列表 ----
-      "#zk-drawer .zk-list{flex:1;overflow-y:auto;padding:6px 0;user-select:text!important;-webkit-user-select:text!important}",
-      ".zk-line{font-family:Consolas,Menlo,monospace;font-size:11px;line-height:1.5;padding:3px 10px;border-bottom:1px solid rgba(255,255,255,.04);white-space:pre-wrap;word-break:break-all;color:#c1c5ca}",
+      // ---- 日志行 ----
+      ".zk-line{font-family:Consolas,Menlo,monospace;font-size:10.5px;line-height:1.5;padding:3px 8px;border-bottom:1px solid rgba(255,255,255,.04);white-space:pre-wrap;word-break:break-all;color:#c1c5ca}",
       ".zk-line .zk-t{color:#5f6368}",
       ".zk-lv-OK{color:#7fb99a}.zk-lv-WARN{color:#d0b268}.zk-lv-ERROR{color:#dd8377}.zk-lv-FATAL{color:#e58e85;font-weight:600}.zk-lv-PAGE{color:#8b9096}.zk-lv-DBG{color:#6f8ba3}.zk-lv-INFO{color:#c1c5ca}",
-      "#zk-drawer .zk-empty{color:#5f6368;font-size:12px;text-align:center;padding:20px 0}",
+      ".zk-empty{color:#5f6368;font-size:11px;text-align:center;padding:20px 0}",
       '#zk-loglist.only-err .zk-line[data-lvl="DBG"],#zk-loglist.only-err .zk-line[data-lvl="INFO"],#zk-loglist.only-err .zk-line[data-lvl="OK"],#zk-loglist.only-err .zk-line[data-lvl="PAGE"]{display:none}',
       // ---- 设置抽屉 ----
       "#zk-settings .zk-body{flex:1;overflow-y:auto;padding:10px 12px 20px}",
@@ -489,12 +493,21 @@
       '<div class="zk-title"><span class="zk-dot"></span><span class="zk-name">职行力助手</span>' +
       '<span class="zk-ver">v' + VERSION + '</span><button class="zk-fold" title="收起到微标">—</button></div>' +
       '<button class="zk-btn zk-primary"></button>' +
-      '<div style="display:flex;gap:6px">' +
-      '<button class="zk-btn zk-ghost" style="flex:1">复制解锁</button>' +
+      '<div style="display:flex;gap:4px">' +
+      '<button class="zk-btn zk-ghost" id="zk-copybtn" style="flex:1">复制</button>' +
       '<button class="zk-btn zk-ghost" id="zk-setbtn" style="flex:1">设置</button>' +
+      '<button class="zk-btn zk-ghost" id="zk-logbtn" style="flex:1">日志<span id="zk-logbadge" hidden></span></button>' +
       "</div>" +
       '<div class="zk-status">待命</div>' +
       '<div class="zk-sub"></div>' +
+      '<div class="zk-logsec">' +
+      '<div class="zk-logbar">' +
+      '<button class="zk-mini" id="zk-filter">只看异常</button>' +
+      '<button class="zk-mini accent" id="zk-copy">复制排查</button>' +
+      '<button class="zk-mini" id="zk-clear">清空</button>' +
+      "</div>" +
+      '<div class="zk-loglist" id="zk-loglist"></div>' +
+      "</div>" +
       "</div>";
     document.body.appendChild(panel);
 
@@ -523,14 +536,44 @@
       }
     };
 
-    const copyBtn = panel.querySelector(".zk-ghost:not(#zk-setbtn)");
+    const copyBtn = panel.querySelector("#zk-copybtn");
     copyBtn.onclick = () => {
       const b = document.body;
       b.contentEditable = b.contentEditable === "true" ? "false" : "true";
-      copyBtn.textContent = b.contentEditable === "true" ? "已可复制" : "复制解锁";
+      copyBtn.textContent = b.contentEditable === "true" ? "已可复制" : "复制";
     };
 
     panel.querySelector("#zk-setbtn").onclick = toggleSettings;
+
+    // 日志视图：在面板内展开/收起（不再有独立抽屉）
+    panel.querySelector("#zk-logbtn").onclick = () => {
+      const open = panel.classList.toggle("zk-logopen");
+      if (open) { lastSeenErrAt = now(); renderLogs(); }
+      updateBadge();
+      pokeDim();
+    };
+    panel.querySelector("#zk-filter").onclick = (ev) => {
+      const list = document.getElementById("zk-loglist");
+      const on = list.classList.toggle("only-err");
+      ev.target.textContent = on ? "显示全部" : "只看异常";
+    };
+    panel.querySelector("#zk-clear").onclick = () => {
+      logs = [];
+      logDirty = false;
+      if (logFlushTimer) { clearTimeout(logFlushTimer); logFlushTimer = 0; }
+      store.set("logs", logs);
+      lastSeenErrAt = now();
+      renderLogs();
+      updateBadge();
+      notify("日志已清空", "ok");
+    };
+    panel.querySelector("#zk-copy").onclick = () => {
+      copyText(buildReport()).then((ok) => {
+        if (ok) notify("排查信息已复制（含最近 1000 条日志）", "ok");
+        else notify("复制失败，请在日志列表中手动选择复制", "error");
+      });
+    };
+
     panel.querySelector(".zk-fold").onclick = () => setCollapsed(true);
     panel.querySelector(".zk-pill").onclick = () => setCollapsed(false);
     if (store.get("uiCollapsed", false)) panel.classList.add("zk-collapsed");
@@ -582,59 +625,7 @@
     if (panelEls.pillDot) panelEls.pillDot.style.background = dotColor;
   }
 
-  // ---------- 日志抽屉（右侧） ----------
-  function ensureDrawer() {
-    if (document.getElementById("zk-drawer")) return;
-    ensureStyles();
-
-    const dock = document.createElement("div");
-    dock.id = "zk-dock";
-    dock.title = "打开运行日志";
-    dock.innerHTML = '日志<span id="zk-badge" hidden></span>';
-
-    const drawer = document.createElement("div");
-    drawer.id = "zk-drawer";
-    drawer.innerHTML =
-      '<div class="zk-dh"><span>运行日志</span><span class="zk-grow"></span>' +
-      '<button class="zk-mini" id="zk-filter">只看异常</button>' +
-      '<button class="zk-mini accent" id="zk-copy">复制排查信息</button>' +
-      '<button class="zk-mini" id="zk-clear">清空</button>' +
-      '<button class="zk-mini" id="zk-close">收起</button></div>' +
-      '<div class="zk-list" id="zk-loglist"></div>';
-
-    document.body.appendChild(dock);
-    document.body.appendChild(drawer);
-
-    dock.onclick = () => {
-      const open = drawer.classList.toggle("open");
-      if (open) { lastSeenErrAt = now(); renderLogs(); updateBadge(); }
-    };
-    drawer.querySelector("#zk-close").onclick = () => drawer.classList.remove("open");
-    drawer.querySelector("#zk-filter").onclick = (ev) => {
-      const list = document.getElementById("zk-loglist");
-      const on = list.classList.toggle("only-err");
-      ev.target.textContent = on ? "显示全部" : "只看异常";
-    };
-    drawer.querySelector("#zk-clear").onclick = () => {
-      logs = [];
-      logDirty = false;
-      if (logFlushTimer) { clearTimeout(logFlushTimer); logFlushTimer = 0; }
-      store.set("logs", logs);
-      lastSeenErrAt = now();
-      renderLogs();
-      updateBadge();
-      notify("日志已清空", "ok");
-    };
-    drawer.querySelector("#zk-copy").onclick = () => {
-      copyText(buildReport()).then((ok) => {
-        if (ok) notify("排查信息已复制（含最近 1000 条日志）", "ok");
-        else notify("复制失败，请在日志列表中手动选择复制", "error");
-      });
-    };
-    renderLogs();
-  }
-
-  const DOM_LINE_MAX = 800; // 抽屉最多渲染行数（更早的仍在内存与报告中）
+  const DOM_LINE_MAX = 800; // 面板日志区最多渲染行数（更早的仍在内存与报告中）
 
   function lineHtml(e) {
     return '<span class="zk-t">' + fmtTime(e.t) + "</span> " +
@@ -655,10 +646,10 @@
     updateBadge();
   }
 
-  // 增量追加渲染：仅抽屉打开时更新 DOM，避免全量日志影响页面流畅度
+  // 增量追加渲染：仅面板日志视图展开时更新 DOM，避免全量日志影响页面流畅度
   function appendLogLine(e) {
-    const drawerEl = document.getElementById("zk-drawer");
-    if (!drawerEl || !drawerEl.classList.contains("open")) return; // 关闭时零 DOM 开销
+    const panel = document.getElementById("zk-panel");
+    if (!panel || !panel.classList.contains("zk-logopen")) return; // 收起时零 DOM 开销
     const list = document.getElementById("zk-loglist");
     if (!list) return;
     const empty = list.querySelector(".zk-empty");
@@ -674,7 +665,7 @@
   }
 
   function updateBadge() {
-    const b = document.getElementById("zk-badge");
+    const b = document.getElementById("zk-logbadge");
     if (!b) return;
     const n = logs.filter((e) => (e.lvl === "ERROR" || e.lvl === "FATAL") && e.t > lastSeenErrAt).length;
     b.hidden = n === 0;
@@ -1801,7 +1792,6 @@
     try {
       ensureStyles();
       ensurePanel();
-      ensureDrawer();
       ensureSettings();
     } catch (e) { console.error("[职行力] UI初始化异常", e); }
   }
