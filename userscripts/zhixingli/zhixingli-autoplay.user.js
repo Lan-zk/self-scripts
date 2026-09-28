@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         职行力自动刷课助手
 // @namespace    https://github.com/Lan-zk
-// @version      3.20
-// @description  自动播放和评价职行力课程。克制的辅助仪器界面（闲置淡化/可折叠微标/提示分级静默）；多讲课程收尾防循环；后台持续推进；设置抽屉免改代码；全量日志。
+// @version      3.21
+// @description  自动播放和评价职行力课程。克制的辅助仪器界面；多讲课程收尾防循环；后台持续推进（Worker 驱动/可见性+失焦伪装/可选主动画中画）；面板内设置与全量日志。
 // @author       Lan-zk
 // @source       https://greasyfork.org/scripts/455353
 // @match        https://u.exexm.com/*
@@ -19,9 +19,10 @@
  *    location.reload() 自愈（运行状态持久化在 localStorage，刷新后自动续跑）。
  * 3. 自动刷新带熔断器：10 分钟内最多 3 次，防止"刷新→又立刻刷新"死循环。
  * 4. 弹窗治理：堆叠的 ion-modal 自动清理；系统确认框按升级阶梯处理；奖励弹窗自动关闭。
- * 5. 后台运行：Web Worker 驱动 + 静音音频防节流 + 可见性伪装 + 停滞自动续播。
- * 6. 日志抽屉：全量动作/状态快照落盘（跨刷新保留），右侧"日志"入口打开，
- *    "复制排查信息"一键导出完整报告；"设置"抽屉动态调整参数，免改代码。
+ * 5. 后台运行：Web Worker 驱动 + 静音音频防节流 + 可见性/失焦伪装 + 停滞自动续播
+ *    + 可选画中画（主动保活：后台即进小窗、回前台退出；或停滞兜底）。
+ * 6. 日志与设置：均收敛在主面板内展开；全量动作/状态快照落盘（跨刷新保留），
+ *    "复制排查信息"一键导出完整报告；设置即时生效并持久化，免改代码。
  *
  * 致谢：基于 misaka10032w 的「职行力视频自动播放」(greasyfork #455353) 重写，
  * 原版仅保留课程分发思路；其余（状态机/弹窗治理/日志/设置/后台对抗）均为重构。
@@ -30,7 +31,7 @@
 (function () {
   "use strict";
 
-  const VERSION = "3.20";
+  const VERSION = "3.21";
   const LOG_MAX = 2500; // 日志最多保留条数（超出丢弃最旧的；抽屉里最多渲染 800 条）
 
   // ===================== 配置 =====================
@@ -46,7 +47,8 @@
     stuckOpenSec: 45,          // 打开课件/弹窗多久没出现视为卡死（秒）
     stuckPlayingSec: 180,      // 播放中多久无进度视为卡死（秒）
     stallResumeSec: 15,        // 播放中进度停滞多久就自动续播（秒；细粒度，专门对付后台暂停）
-    pipFallback: false,        // true=后台时让视频进画中画小窗（最彻底但会弹出小窗；默认关）
+    pipFallback: false,        // true=进度停滞时才让视频进画中画小窗兜底（会弹出小窗；默认关）
+    pipOnHide: false,          // true=页面一进后台就主动进画中画小窗（小窗持续渲染且豁免标签页冻结，后台推进最彻底）；回前台自动退出
     noProgressMin: 12,         // 整体多久无任何进展就自愈刷新（分钟）
     reloadAfterHours: 3,       // 连续运行该时长后，择机（回到学习页空档）刷新释放内存；0=关闭
     heapLimitMB: 2000,         // JS 堆超过该 MB 数择机刷新（仅 Chrome 可感知；0=关闭）
@@ -54,6 +56,7 @@
     alertPolicy: "last",       // 系统确认框处理："last"=点最后一个按钮 / "cancel"=点取消 / null=不处理
     antiThrottle: true,        // 挂后台时防止定时器被 Chrome 节流（静音音频，无声音）
     spoofVisibility: true,     // 伪装页面"始终可见"：阻止播放器在后台/最小化时自动暂停（本脚本核心诉求）
+    spoofFocus: true,          // 失焦伪装：拦截 window blur + hasFocus() 恒真 + 失焦后立即补发合成 focus，对付"失焦即暂停"的播放器
     debug: false,              // true=额外在控制台实时输出（页面日志始终全量记录；DevTools 开着时控制台输出更卡，故默认关）
 
     // ---- 界面（辅助性：可淡化、可折叠、提示可静默） ----
@@ -68,7 +71,7 @@
   // 不能在这里立即执行——store/CFG 工具尚未就绪，早前版本因此启动即崩。
   const USER_KEYS = [
     "stars", "comment", "commentFallback", "playbackRate", "muted",
-    "alertPolicy", "pipFallback", "antiThrottle", "debug",
+    "alertPolicy", "pipFallback", "pipOnHide", "spoofFocus", "antiThrottle", "debug",
     "stuckOpenSec", "stuckPlayingSec", "stallResumeSec", "noProgressMin",
     "reloadAfterHours", "heapLimitMB", "toastLevel", "autoDim",
   ];
@@ -614,6 +617,7 @@
         startAntiThrottle();
         startSilentAudio(); // 用户点击即手势，静音保活从这里开始生效
         installVisibilitySpoof(); // 点击时机安装，确保属性覆写成功
+        installFocusSpoof();
         setState("idle");
         notify("已开始刷课，将自动前往学习页", "ok");
         tick(); // 点击后立即执行一拍，不用等最多 5 秒的轮询
@@ -878,10 +882,26 @@
   // visibilitychange/blur；TC Player 等播放器监听这些信号就会暂停或停止推进。
   // 这里覆写属性与事件，让页面始终读到 "visible"。（本脚本自身的调度不依赖这些信号）
   let spoofInstalled = false;
+  // 真实可见性读取器：属性被伪装后 document.hidden 恒为 false，但本脚本自身
+  // （主动画中画、隐藏时落盘日志）仍需要知道页面是否真的在后台——覆写前把原始 getter 留底。
+  let realHiddenGet = null;
+  function pageHiddenReal() {
+    try {
+      return realHiddenGet ? !!realHiddenGet.call(document) : !!document.hidden; // 伪装未启用时属性即真实值
+    } catch (e) { return false; }
+  }
   function installVisibilitySpoof() {
     if (spoofInstalled || !CFG.spoofVisibility) return;
     try {
       const doc = document;
+      // 0) 留底原始 hidden getter（沿原型链找，供本脚本自检真实后台状态）
+      try {
+        let d = Object.getOwnPropertyDescriptor(doc, "hidden");
+        for (let p = Object.getPrototypeOf(doc); !d && p; p = Object.getPrototypeOf(p)) {
+          d = Object.getOwnPropertyDescriptor(p, "hidden");
+        }
+        if (d && d.get) realHiddenGet = d.get;
+      } catch (e) {}
       // 1) 属性伪装
       for (const prop of ["visibilityState", "webkitVisibilityState"]) {
         try {
@@ -913,10 +933,6 @@
           doc.dispatchEvent(ev);
         } catch (er) {}
       }, true); // 捕获阶段最先执行
-      // 3) 窗口失焦伪装（部分播放器监听 blur 暂停）
-      try {
-        Object.defineProperty(window, "document", { value: doc }); // no-op 保护
-      } catch (e) {}
       spoofInstalled = true;
       record("INFO", "可见性伪装已启用（后台/最小化时页面对播放器保持'可见'）");
     } catch (e) {
@@ -924,17 +940,71 @@
     }
   }
 
-  // 画中画兜底：后台时把视频放进 PiP 小窗（物理上持续渲染，推进最彻底；会弹出小窗）
-  let pipActive = false;
-  async function maybePiP(media) {
-    if (!CFG.pipFallback || pipActive) return;
+  // ---------- 失焦伪装：补齐可见性伪装盖不住的"窗口失焦"信号 ----------
+  // 属性伪装只对"页面主动读状态"有效；不少播放器直接监听 window 的 blur 事件暂停播放。
+  // 三件事：① 拦截 blur（只对在本脚本之后注册的监听有效）；② hasFocus() 恒真；
+  // ③ 真失焦后立刻补发合成 focus——"失焦暂停/获焦恢复"成对实现的播放器会被立即拉回。
+  // （站点早于本脚本注册的监听器无法摘除，③ 就是为它们准备的。）
+  let focusSpoofInstalled = false;
+  function installFocusSpoof() {
+    if (focusSpoofInstalled || !CFG.spoofFocus) return;
     try {
-      if (media !== document.pictureInPictureElement && media.requestPictureInPicture) {
-        await media.requestPictureInPicture();
-        pipActive = true;
-        record("INFO", "已进入画中画模式（后台保活播放）");
+      try { document.hasFocus = () => true; } catch (e) {}
+      window.addEventListener("blur", (e) => {
+        try { if (e.isTrusted) e.stopImmediatePropagation(); } catch (er) {}
+        if (running) {
+          // 用微任务补发（不被后台定时器节流）；站点已跑过的 blur 监听会看到"紧接着又获焦"
+          try {
+            queueMicrotask(() => window.dispatchEvent(new FocusEvent("focus")));
+          } catch (er) { setTimeout(() => window.dispatchEvent(new FocusEvent("focus")), 50); }
+        }
+      }, true);
+      focusSpoofInstalled = true;
+      record("INFO", "失焦伪装已启用（blur 拦截 + hasFocus 恒真 + 合成 focus 补发）");
+    } catch (e) {
+      record("WARN", "失焦伪装安装失败：" + (e && e.message));
+    }
+  }
+
+  // ---------- 画中画：主动保活与停滞兜底共用一个入口 ----------
+  // 主动模式（pipOnHide）：页面一进后台立即把视频切进 PiP 小窗——小窗持续渲染且豁免
+  //   标签页冻结，是后台推进最彻底的手段；回到前台自动退出。切换课件会自动重进。
+  // 兜底模式（pipFallback）：进度停滞时才进 PiP（原行为，不自动退出）。
+  let pipActive = false;   // 兜底模式已进入
+  let pipAuto = false;     // 主动模式已进入（回前台时要自动退出）
+  let lastPipTryAt = 0;    // 进入尝试冷却：被拒绝后 30s 内不重试，避免每拍刷日志
+  async function enterPip(media, why) {
+    try {
+      if (!media || !media.requestPictureInPicture) return false;
+      if (document.pictureInPictureElement) return false;
+      if (now() - lastPipTryAt < 30000) return false;
+      lastPipTryAt = now();
+      await media.requestPictureInPicture();
+      record("INFO", "已进入画中画（" + why + "）");
+      return true;
+    } catch (e) {
+      record("DBG", "画中画进入失败：" + String((e && e.message) || e).slice(0, 80));
+      return false;
+    }
+  }
+  async function maybePiP(media) {
+    if (!CFG.pipFallback || pipActive || pipAuto) return;
+    if (await enterPip(media, "后台停滞兜底")) pipActive = true;
+  }
+  // 主动模式：后台即进、回前台即退（manageMedia 每拍调用；内部有冷却与状态判断）
+  async function pipHideCheck(media) {
+    if (!CFG.pipOnHide) return;
+    if (pageHiddenReal()) {
+      if (media && media.tagName === "VIDEO" && !document.pictureInPictureElement) {
+        if (await enterPip(media, "页面进入后台，主动保活")) pipAuto = true;
       }
-    } catch (e) { /* 不支持/被拒绝则静默 */ }
+    } else if (pipAuto && document.pictureInPictureElement) {
+      pipAuto = false;
+      try {
+        await document.exitPictureInPicture();
+        record("INFO", "已退出画中画（回到前台）");
+      } catch (e) {}
+    }
   }
   // 主线程的 setTimeout/setInterval 在后台标签页会降到 1 次/分钟甚至完全冻结；
   // Worker 线程的定时器宽松得多，用它来驱动 tick，尽量让脚本在后台也能推进。
@@ -1278,6 +1348,7 @@
     }
     setState("playing");
     refreshStatus();
+    pipHideCheck(media); // 主动画中画：后台即进、回前台即退（异步每拍检查，内部有冷却）
 
     // 细粒度停滞续播：后台/最小化时播放器可能暂停推进。
     // 与 180s 看门狗不同层：这里 15s 一查，停了就 play() 拉起（必要时换播放器大按钮）。
@@ -1833,11 +1904,13 @@
     { sec: "播放" },
     { key: "playbackRate", type: "number", min: 0, max: 16, step: 1, label: "强制倍速", tip: "0=不干预（用播放器自己的设置）" },
     { key: "muted", type: "switch", label: "自动静音", tip: "关闭会有声音" },
-    { key: "pipFallback", type: "switch", label: "画中画兜底", tip: "后台停滞时进画中画小窗" },
+    { key: "pipOnHide", type: "switch", label: "主动画中画", tip: "切到后台立即进小窗保活，回前台自动退出" },
+    { key: "pipFallback", type: "switch", label: "画中画兜底", tip: "后台停滞时才进画中画小窗" },
     { sec: "自动化" },
     { key: "alertPolicy", type: "select", label: "确认框处理", tip: "系统弹窗点哪个按钮",
       options: [["last", "点最后一个（确定类）"], ["cancel", "点取消类"], ["", "不处理（手动）"]] },
     { key: "antiThrottle", type: "switch", label: "后台防节流", tip: "静音音频防止定时器被冻结" },
+    { key: "spoofFocus", type: "switch", label: "失焦伪装", tip: "拦截 blur+伪装页面焦点，防站点失焦暂停" },
     { sec: "阈值（进阶）" },
     { key: "stallResumeSec", type: "number", min: 10, max: 120, step: 5, label: "停滞续播", tip: "秒，进度停多久自动拉起" },
     { key: "stuckPlayingSec", type: "number", min: 60, max: 600, step: 30, label: "播放卡死判定", tip: "秒，超过则尝试恢复/刷新" },
@@ -1959,7 +2032,9 @@
   });
   document.addEventListener("visibilitychange", () => {
     tryResumeAudio();
-    if (document.hidden) flushLogs(); // 页面隐藏时立即落盘，防刷新丢日志
+    // 必须用真实状态判断：document.hidden 已被伪装成恒 false（v3.21 修复——
+    // 之前伪装生效后"隐藏落盘"分支永远走不到，只剩 2s 延迟落盘兜底）
+    if (pageHiddenReal()) flushLogs(); // 页面隐藏时立即落盘，防刷新丢日志
     else tick(); // 切回前台立即补一拍
   });
   window.addEventListener("focus", () => tick());
@@ -1989,5 +2064,6 @@
   }
   if (running) { startAntiThrottle(); startSilentAudio(); }
   installVisibilitySpoof();
+  installFocusSpoof();
   setTimeout(loop, 1000);
 })();
