@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         职行力自动刷课助手
 // @namespace    https://github.com/Lan-zk
-// @version      3.19
+// @version      3.20
 // @description  自动播放和评价职行力课程。克制的辅助仪器界面（闲置淡化/可折叠微标/提示分级静默）；多讲课程收尾防循环；后台持续推进；设置抽屉免改代码；全量日志。
 // @author       Lan-zk
 // @source       https://greasyfork.org/scripts/455353
@@ -30,7 +30,7 @@
 (function () {
   "use strict";
 
-  const VERSION = "3.19";
+  const VERSION = "3.20";
   const LOG_MAX = 2500; // 日志最多保留条数（超出丢弃最旧的；抽屉里最多渲染 800 条）
 
   // ===================== 配置 =====================
@@ -85,7 +85,7 @@
         else if (!isNum && v !== undefined) CFG[k] = v;
       }
     }
-    syncSettingsForm(); // 设置抽屉已渲染时，把保存值回填进表单（否则显示默认值，像被重置）
+    syncSettingsForm(); // 设置表单已渲染时，把保存值回填进表单（否则显示默认值，像被重置）
   }
   function saveUserConfig() {
     const out = {};
@@ -252,6 +252,11 @@
       el.className = "zk-toast " + (level || "info");
       el.innerHTML = '<span class="zk-tdot"></span>';
       el.appendChild(document.createTextNode(msg));
+      el.title = "点击关闭";
+      el.onclick = () => { // 点击立即关闭，不必等超时
+        el.classList.add("zk-out");
+        setTimeout(() => { if (el.parentNode) el.parentNode.removeChild(el); }, 350);
+      };
       toastBox.appendChild(el);
       while (toastBox.children.length > 3) toastBox.removeChild(toastBox.firstChild);
       // fatal 常驻不自动消失，其余安静淡出
@@ -380,16 +385,16 @@
     st.id = "zk-style";
     st.textContent = [
       // ---- 面板 ----
-      "#zk-panel{position:fixed;right:14px;bottom:14px;z-index:99999;width:156px;display:flex;flex-direction:column;align-items:flex-end;font-family:'Segoe UI',system-ui,sans-serif}",
+      "#zk-panel{position:fixed;right:14px;bottom:14px;z-index:99999;width:156px;display:flex;flex-direction:column;align-items:flex-end;font-family:'Segoe UI',system-ui,sans-serif;transition:width .18s cubic-bezier(.16,1,.3,1)}",
       "#zk-panel .zk-card{width:100%;box-sizing:border-box;background:rgba(26,28,32,.86);backdrop-filter:blur(8px);border:1px solid rgba(255,255,255,.07);border-radius:12px;padding:9px;box-shadow:0 8px 24px rgba(0,0,0,.28);display:flex;flex-direction:column;gap:7px;transition:opacity .5s ease}",
-      "#zk-panel .zk-title{display:flex;align-items:center;gap:5px;color:#c9cdd3;font-size:11px;font-weight:500}",
+      "#zk-panel .zk-title{display:flex;align-items:center;gap:5px;color:#c9cdd3;font-size:11px;font-weight:500;cursor:move;user-select:none}",
       "#zk-panel .zk-name{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
       "#zk-panel .zk-ver{color:#6b7075;font-size:9.5px;font-weight:400}",
       "#zk-panel .zk-fold{flex:none;width:16px;height:16px;border:none;border-radius:5px;background:transparent;color:#8b9096;font-size:12px;line-height:1;cursor:pointer;padding:0}",
       "#zk-panel .zk-fold:hover{background:rgba(255,255,255,.08);color:#e8eaed}",
       ".zk-dot{flex:none;width:7px;height:7px;border-radius:50%;background:#6b7075;transition:background .4s ease}",
       // 折叠后的微标
-      "#zk-panel .zk-pill{display:none;align-items:center;gap:6px;height:24px;padding:0 10px;border-radius:12px;background:rgba(26,28,32,.86);backdrop-filter:blur(8px);border:1px solid rgba(255,255,255,.07);cursor:pointer;font-size:11px;color:#bdc1c6;box-shadow:0 4px 14px rgba(0,0,0,.22);transition:opacity .5s ease;user-select:none}",
+      "#zk-panel .zk-pill{display:none;align-items:center;gap:6px;height:24px;padding:0 10px;border-radius:12px;background:rgba(26,28,32,.86);backdrop-filter:blur(8px);border:1px solid rgba(255,255,255,.07);cursor:grab;font-size:11px;color:#bdc1c6;box-shadow:0 4px 14px rgba(0,0,0,.22);transition:opacity .5s ease;user-select:none}",
       "#zk-panel .zk-pill:hover{color:#e8eaed}",
       "#zk-panel.zk-collapsed .zk-card{display:none}",
       "#zk-panel.zk-collapsed .zk-pill{display:flex}",
@@ -400,17 +405,17 @@
       ".zk-btn{border:none;border-radius:7px;cursor:pointer;font-family:inherit;transition:background .15s ease,transform .06s ease}",
       ".zk-btn:hover{background:rgba(255,255,255,.14)!important}",
       ".zk-btn:active{transform:scale(.98)}",
-      ".zk-primary{width:100%;height:31px;font-size:12.5px;font-weight:600;background:#37694e;color:#dfe9e2}",
-      ".zk-primary.on{background:#7a4a42;color:#efe2df}",
+      ".zk-primary{width:100%;height:31px;font-size:12.5px;font-weight:600;background:#4a6a8f;color:#dfe9e2}",
+      ".zk-primary.on{background:#96574e;color:#efe2df}",
       ".zk-ghost{height:23px;font-size:11px;font-weight:400;background:rgba(255,255,255,.06);color:#bdc1c6}",
       // ---- 状态 ----
       ".zk-status{color:#d5d8dc;font-size:11.5px;font-weight:500;padding:0 2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
       ".zk-sub{color:#8b9096;font-size:10px;padding:0 2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
       // ---- 提示（右上角耳语） ----
       "#zk-toasts{position:fixed;top:14px;right:16px;z-index:100000;display:flex;flex-direction:column;align-items:flex-end;gap:6px;max-width:300px;pointer-events:none;font-family:'Segoe UI',system-ui,sans-serif}",
-      ".zk-toast{display:flex;align-items:flex-start;gap:7px;padding:7px 11px;border-radius:9px;font-size:12px;line-height:1.45;color:#d9dbde;background:rgba(28,30,34,.9);border:1px solid rgba(255,255,255,.06);box-shadow:0 6px 18px rgba(0,0,0,.24);word-break:break-all;opacity:.96;transition:opacity .35s ease,transform .35s ease;animation:zk-in .18s ease-out}",
+      ".zk-toast{display:flex;align-items:flex-start;gap:7px;padding:7px 11px;border-radius:9px;font-size:12px;line-height:1.45;color:#d9dbde;background:rgba(28,30,34,.9);border:1px solid rgba(255,255,255,.06);box-shadow:0 6px 18px rgba(0,0,0,.24);word-break:break-all;opacity:.96;transition:opacity .35s ease,transform .35s ease;animation:zk-in .18s ease-out;pointer-events:auto;cursor:pointer}",
       ".zk-tdot{flex:none;width:6px;height:6px;border-radius:50%;margin-top:5px;background:#9aa0a6}",
-      ".zk-toast.ok .zk-tdot{background:#4d9e6f}",
+      ".zk-toast.ok .zk-tdot{background:#4f9e79}",
       ".zk-toast.warn .zk-tdot{background:#c9a04a}",
       ".zk-toast.error .zk-tdot,.zk-toast.fatal .zk-tdot{background:#cf5b50}",
       ".zk-toast.fatal{color:#f2d7d3;font-weight:600}",
@@ -426,37 +431,42 @@
       "#zk-panel .zk-loglist{height:210px;overflow-y:auto;background:rgba(0,0,0,.25);border:1px solid rgba(255,255,255,.05);border-radius:8px;padding:4px 0;user-select:text!important;-webkit-user-select:text!important}",
       "#zk-logbtn{position:relative}",
       "#zk-logbadge{position:absolute;top:-5px;right:-4px;background:#8c3f38;color:#f2d7d3;border-radius:8px;font-size:9px;min-width:14px;height:14px;line-height:14px;text-align:center;padding:0 3px;font-weight:600}",
-      // ---- 设置抽屉 ----
-      "#zk-settings{position:fixed;top:0;right:0;bottom:0;width:336px;max-width:92vw;background:rgba(24,26,30,.97);border-left:1px solid rgba(255,255,255,.07);z-index:100003;display:flex;flex-direction:column;font-family:'Segoe UI',system-ui,sans-serif;transform:translateX(100%);transition:transform .22s ease;pointer-events:none;box-shadow:-8px 0 32px rgba(0,0,0,.35)}",
-      "#zk-settings.open{transform:none;pointer-events:auto}",
-      "#zk-settings .zk-dh{display:flex;align-items:center;gap:6px;padding:9px 12px;border-bottom:1px solid rgba(255,255,255,.06);color:#c9cdd3;font-size:12px;font-weight:500}",
-      ".zk-grow{flex:1}",
       ".zk-mini{background:rgba(255,255,255,.07);border:none;color:#bdc1c6;border-radius:6px;padding:4px 9px;font-size:10.5px;cursor:pointer;font-family:inherit;white-space:nowrap;transition:background .15s ease}",
       ".zk-mini:hover{background:rgba(255,255,255,.15);color:#e8eaed}",
-      ".zk-mini.accent{background:#46688c;color:#e2e9f0}",
-      ".zk-mini.accent:hover{background:#52779e}",
+      ".zk-mini.accent{background:#4a6a8f;color:#e2e9f0}",
+      ".zk-mini.accent:hover{background:#54789f}",
       // ---- 日志行 ----
       ".zk-line{font-family:Consolas,Menlo,monospace;font-size:10.5px;line-height:1.5;padding:3px 8px;border-bottom:1px solid rgba(255,255,255,.04);white-space:pre-wrap;word-break:break-all;color:#c1c5ca}",
       ".zk-line .zk-t{color:#5f6368}",
       ".zk-lv-OK{color:#7fb99a}.zk-lv-WARN{color:#d0b268}.zk-lv-ERROR{color:#dd8377}.zk-lv-FATAL{color:#e58e85;font-weight:600}.zk-lv-PAGE{color:#8b9096}.zk-lv-DBG{color:#6f8ba3}.zk-lv-INFO{color:#c1c5ca}",
       ".zk-empty{color:#5f6368;font-size:11px;text-align:center;padding:20px 0}",
       '#zk-loglist.only-err .zk-line[data-lvl="DBG"],#zk-loglist.only-err .zk-line[data-lvl="INFO"],#zk-loglist.only-err .zk-line[data-lvl="OK"],#zk-loglist.only-err .zk-line[data-lvl="PAGE"]{display:none}',
-      // ---- 设置抽屉 ----
-      "#zk-settings .zk-body{flex:1;overflow-y:auto;padding:10px 12px 20px}",
-      "#zk-settings .zk-sec{color:#7d9cb8;font-size:10.5px;font-weight:600;letter-spacing:.8px;margin:14px 0 6px}",
-      "#zk-settings .zk-sec:first-child{margin-top:2px}",
-      "#zk-settings .zk-row{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:5px 0}",
-      "#zk-settings .zk-lab{color:#bdc1c6;font-size:12px;flex:1}",
-      "#zk-settings .zk-lab small{display:block;color:#6b7075;font-size:10px;margin-top:1px}",
-      "#zk-settings input[type=text],#zk-settings input[type=number],#zk-settings select{background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.1);color:#d5d8dc;border-radius:7px;padding:4px 8px;font-size:12px;font-family:inherit;outline:none}",
-      "#zk-settings input[type=text]{width:166px}",
-      "#zk-settings input[type=number]{width:72px;text-align:right}",
-      "#zk-settings input:focus,#zk-settings select:focus{border-color:#7d9cb8}",
-      "#zk-settings .zk-switch{position:relative;width:36px;height:19px;border-radius:10px;background:rgba(255,255,255,.13);border:none;cursor:pointer;transition:background .2s;flex:none}",
-      "#zk-settings .zk-switch::after{content:'';position:absolute;top:2px;left:2px;width:15px;height:15px;border-radius:50%;background:#bdc1c6;transition:left .2s}",
-      "#zk-settings .zk-switch.on{background:#37694e}",
-      "#zk-settings .zk-switch.on::after{left:19px;background:#dfe9e2}",
-      "#zk-settings .zk-note{color:#6b7075;font-size:10px;line-height:1.6;margin-top:10px;border-top:1px solid rgba(255,255,255,.05);padding-top:8px}",
+      // ---- 面板内设置区（点"设置"展开） ----
+      "#zk-panel.zk-setopen{width:324px}",
+      "#zk-panel .zk-setsec{display:none;flex-direction:column;gap:2px;max-height:300px;overflow-y:auto;background:rgba(0,0,0,.18);border:1px solid rgba(255,255,255,.05);border-radius:8px;padding:6px 8px;animation:zk-sec-in .22s cubic-bezier(.16,1,.3,1)}",
+      "#zk-panel.zk-setopen .zk-setsec{display:flex}",
+      "#zk-panel .zk-sec{color:#8aa2bd;font-size:10px;font-weight:600;letter-spacing:.8px;margin:8px 0 3px}",
+      "#zk-panel .zk-sec:first-child{margin-top:0}",
+      "#zk-panel .zk-row{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:3px 0}",
+      "#zk-panel .zk-lab{color:#bdc1c6;font-size:11.5px;flex:1;min-width:0}",
+      "#zk-panel .zk-lab small{display:block;color:#6b7075;font-size:9.5px;margin-top:1px}",
+      "#zk-panel input[type=text],#zk-panel input[type=number],#zk-panel select{background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.1);color:#d5d8dc;border-radius:7px;padding:3px 7px;font-size:11.5px;font-family:inherit;outline:none}",
+      "#zk-panel input[type=text]{width:128px}",
+      "#zk-panel input[type=number]{width:62px;text-align:right}",
+      "#zk-panel input:focus,#zk-panel select:focus{border-color:#7d9cb8}",
+      "#zk-panel .zk-switch{position:relative;width:34px;height:18px;border-radius:9px;background:rgba(255,255,255,.13);border:none;cursor:pointer;transition:background .2s;flex:none}",
+      "#zk-panel .zk-switch::after{content:'';position:absolute;top:2px;left:2px;width:14px;height:14px;border-radius:50%;background:#bdc1c6;transition:left .2s}",
+      "#zk-panel .zk-switch.on{background:#4a6a8f}",
+      "#zk-panel .zk-switch.on::after{left:18px;background:#dfe6ee}",
+      "#zk-panel .zk-note{color:#6b7075;font-size:9.5px;line-height:1.6;margin-top:8px;border-top:1px solid rgba(255,255,255,.05);padding-top:7px}",
+      // ---- 动效（唯一署名时刻：面板↔微标原地形变；其余为状态反馈） ----
+      "@keyframes zk-pop{from{opacity:0;transform:scale(.94) translateY(4px)}to{opacity:1;transform:none}}",
+      "@keyframes zk-sec-in{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}",
+      "#zk-panel.zk-collapsed .zk-pill{animation:zk-pop .22s cubic-bezier(.16,1,.3,1)}",
+      "#zk-panel:not(.zk-collapsed) .zk-card{animation:zk-pop .22s cubic-bezier(.16,1,.3,1);transform-origin:100% 100%}",
+      "#zk-panel.zk-logopen .zk-logsec,#zk-panel.zk-setopen .zk-setsec{animation:zk-sec-in .22s cubic-bezier(.16,1,.3,1)}",
+      "#zk-panel.zk-dragging *{cursor:grabbing!important;user-select:none!important}",
+      "@media (prefers-reduced-motion:reduce){#zk-panel *,#zk-toasts *{animation:none!important;transition:none!important}}",
     ].join("\n");
     (document.head || document.documentElement).appendChild(st);
   }
@@ -481,6 +491,80 @@
     const p = document.getElementById("zk-panel");
     if (p) p.classList.toggle("zk-collapsed", c);
     pokeDim();
+  }
+
+  // ---------- 视图切换（日志/设置二选一，均在面板内展开） ----------
+  function toggleView(name) {
+    const p = document.getElementById("zk-panel");
+    if (!p) return false;
+    const cls = "zk-" + name + "open";
+    const willOpen = !p.classList.contains(cls);
+    p.classList.remove("zk-logopen", "zk-setopen");
+    if (willOpen) p.classList.add(cls);
+    pokeDim();
+    return willOpen;
+  }
+  function closeViews() {
+    const p = document.getElementById("zk-panel");
+    if (p) p.classList.remove("zk-logopen", "zk-setopen");
+  }
+
+  // ---------- 面板拖拽（卡片标题栏与胶囊均可拖；位置持久化） ----------
+  let zkDragMoved = false;
+  function clampPanel() {
+    const p = document.getElementById("zk-panel");
+    if (!p || !p.style.left) return; // 仍用 right/bottom 锚定时无需处理
+    const r = p.getBoundingClientRect();
+    const nx = Math.min(Math.max(r.left, 4), Math.max(window.innerWidth - r.width - 4, 4));
+    const ny = Math.min(Math.max(r.top, 4), Math.max(window.innerHeight - r.height - 4, 4));
+    p.style.left = nx + "px";
+    p.style.top = ny + "px";
+  }
+  function restoreUiPos() {
+    const p = document.getElementById("zk-panel");
+    const pos = store.get("uiPos", null);
+    if (!p || !pos || typeof pos.x !== "number" || typeof pos.y !== "number") return;
+    p.style.left = Math.min(Math.max(pos.x, 4), Math.max(window.innerWidth - 60, 4)) + "px";
+    p.style.top = Math.min(Math.max(pos.y, 4), Math.max(window.innerHeight - 40, 4)) + "px";
+    p.style.right = "auto";
+    p.style.bottom = "auto";
+  }
+  function makeDraggable(handle, onPlainClick) {
+    handle.addEventListener("pointerdown", (e) => {
+      if (e.button !== 0) return;
+      if (e.target.closest("button")) return; // 折叠钮等控件不触发拖拽
+      const panel = document.getElementById("zk-panel");
+      const rect = panel.getBoundingClientRect();
+      const sx = e.clientX, sy = e.clientY;
+      let moved = false;
+      zkDragMoved = false;
+      const onMove = (ev) => {
+        const dx = ev.clientX - sx, dy = ev.clientY - sy;
+        if (!moved && Math.abs(dx) < 4 && Math.abs(dy) < 4) return;
+        moved = true;
+        zkDragMoved = true;
+        panel.classList.add("zk-dragging");
+        panel.style.left = Math.min(Math.max(rect.left + dx, 4), Math.max(window.innerWidth - panel.offsetWidth - 4, 4)) + "px";
+        panel.style.top = Math.min(Math.max(rect.top + dy, 4), Math.max(window.innerHeight - panel.offsetHeight - 4, 4)) + "px";
+        panel.style.right = "auto";
+        panel.style.bottom = "auto";
+      };
+      const onUp = () => {
+        document.removeEventListener("pointermove", onMove);
+        document.removeEventListener("pointerup", onUp);
+        panel.classList.remove("zk-dragging");
+        if (moved) {
+          const r = panel.getBoundingClientRect();
+          store.set("uiPos", { x: Math.round(r.left), y: Math.round(r.top) });
+          clampPanel();
+        } else if (onPlainClick) {
+          onPlainClick(); // 未移动 = 普通点击（胶囊：原地展开）
+        }
+      };
+      document.addEventListener("pointermove", onMove);
+      document.addEventListener("pointerup", onUp);
+      e.preventDefault();
+    });
   }
   function ensurePanel() {
     if ($("#zk-panel")) return;
@@ -508,8 +592,13 @@
       "</div>" +
       '<div class="zk-loglist" id="zk-loglist"></div>' +
       "</div>" +
+      '<div class="zk-setsec">' +
+      buildSettingsRows() +
+      '<div class="zk-note">所有修改即时生效并自动保存（刷新后仍有效）。强制倍速有被平台判定异常学习的风险，请自行评估。</div>' +
+      "</div>" +
       "</div>";
     document.body.appendChild(panel);
+    bindSettingsRows(panel);
 
     const playBtn = panel.querySelector(".zk-primary");
     if (running) playBtn.classList.add("on");
@@ -543,11 +632,13 @@
       copyBtn.textContent = b.contentEditable === "true" ? "已可复制" : "复制";
     };
 
-    panel.querySelector("#zk-setbtn").onclick = toggleSettings;
+    panel.querySelector("#zk-setbtn").onclick = () => {
+      if (toggleView("set")) syncSettingsForm();
+    };
 
     // 日志视图：在面板内展开/收起（不再有独立抽屉）
     panel.querySelector("#zk-logbtn").onclick = () => {
-      const open = panel.classList.toggle("zk-logopen");
+      const open = toggleView("log");
       if (open) { lastSeenErrAt = now(); renderLogs(); }
       updateBadge();
       pokeDim();
@@ -574,9 +665,15 @@
       });
     };
 
-    panel.querySelector(".zk-fold").onclick = () => setCollapsed(true);
-    panel.querySelector(".zk-pill").onclick = () => setCollapsed(false);
+    // 拖拽：标题栏与胶囊均可拖动；胶囊普通点击 = 原地展开
+    makeDraggable(panel.querySelector(".zk-title"));
+    makeDraggable(panel.querySelector(".zk-pill"), () => setCollapsed(false));
+    panel.querySelector(".zk-fold").onclick = () => {
+      if (zkDragMoved) { zkDragMoved = false; return; } // 拖拽结束的误触不折叠
+      setCollapsed(true);
+    };
     if (store.get("uiCollapsed", false)) panel.classList.add("zk-collapsed");
+    restoreUiPos();
     // 淡化交互：鼠标在面板内移动/页面点击都视为"被注意"
     panel.addEventListener("mousemove", pokeDim);
     panel.addEventListener("mouseleave", pokeDim);
@@ -620,7 +717,7 @@
     setStatus(main, "已刷 " + stats.items + " 节/" + stats.courses + " 课 · " +
       fmtDur(now() - bootAt) + (mem ? " · " + mem : ""));
     // 状态点：弱绿=运行，弱红=熔断，灰=停止。颜色只有三种，其余交给文字
-    const dotColor = state === "halt" ? "#cf5b50" : (running ? "#4d9e6f" : "#6b7075");
+    const dotColor = state === "halt" ? "#cf5b50" : (running ? "#4f9e79" : "#6b7075");
     if (panelEls.dot) panelEls.dot.style.background = dotColor;
     if (panelEls.pillDot) panelEls.pillDot.style.background = dotColor;
   }
@@ -1726,7 +1823,7 @@
       .finally(() => setTimeout(loop, CFG.interval));
   }
 
-  // ---------- 设置抽屉（动态配置，即时生效） ----------
+  // ---------- 设置（收敛在主面板内，点"设置"展开；修改即时生效并持久化） ----------
   // 字段清单：key / 标签 / 说明 / 控件类型 / 选项
   const SETTING_FIELDS = [
     { sec: "评价" },
@@ -1753,16 +1850,11 @@
       options: [["all", "全部提示"], ["warn", "仅异常与警告"], ["off", "静默（仅记日志）"]] },
     { key: "autoDim", type: "switch", label: "面板自动淡化", tip: "闲置 8 秒后降低存在感，移过鼠标恢复" },
     { sec: "调试" },
-    { key: "debug", type: "switch", label: "控制台实时输出", tip: "日志抽屉始终全量记录" },
+    { key: "debug", type: "switch", label: "控制台实时输出", tip: "日志始终全量记录到面板日志区" },
   ];
 
-  function ensureSettings() {
-    if (document.getElementById("zk-settings")) return;
-    ensureStyles();
-    const box = document.createElement("div");
-    box.id = "zk-settings";
-    let html = '<div class="zk-dh"><span>设置</span><span class="zk-grow"></span>' +
-      '<button class="zk-mini" id="zk-set-close">关闭</button></div><div class="zk-body">';
+  function buildSettingsRows() {
+    let html = "";
     for (const f of SETTING_FIELDS) {
       if (f.sec) { html += '<div class="zk-sec">' + f.sec + "</div>"; continue; }
       html += '<div class="zk-row" data-key="' + f.key + '"><div class="zk-lab">' + f.label +
@@ -1781,12 +1873,11 @@
       }
       html += "</div>";
     }
-    html += '<div class="zk-note">所有修改即时生效并自动保存（刷新后仍有效）。' +
-      "强制倍速会覆盖播放器自身设置，过高倍速有被平台判定异常的风险，请自行评估。</div></div>";
-    box.innerHTML = html;
-    document.body.appendChild(box);
+    return html;
+  }
 
-    // 事件绑定：任何改动 → 写 CFG → 持久化 → 记日志
+  // 事件绑定：任何改动 → 写 CFG → 持久化 → 记日志
+  function bindSettingsRows(root) {
     const commit = (key, val) => {
       const old = CFG[key];
       if (old === val) return;
@@ -1796,7 +1887,7 @@
     };
     for (const f of SETTING_FIELDS) {
       if (f.sec) continue;
-      const row = box.querySelector('.zk-row[data-key="' + f.key + '"]');
+      const row = root.querySelector('.zk-row[data-key="' + f.key + '"]');
       if (!row) continue;
       if (f.type === "switch") {
         const sw = row.querySelector(".zk-switch");
@@ -1823,21 +1914,15 @@
         };
       }
     }
-    box.querySelector("#zk-set-close").onclick = () => box.classList.remove("open");
   }
 
-  function toggleSettings() {
-    ensureSettings();
-    document.getElementById("zk-settings").classList.toggle("open");
-  }
-
-  // 把 CFG 当前值回填到已渲染的设置表单（applyUserConfig 合并后调用，保证显示与行为一致）
+  // 把 CFG 当前值回填到面板内的设置表单（applyUserConfig 合并后调用，保证显示与行为一致）
   function syncSettingsForm() {
-    const box = document.getElementById("zk-settings");
-    if (!box) return;
+    const root = document.getElementById("zk-panel");
+    if (!root) return;
     for (const f of SETTING_FIELDS) {
       if (f.sec) continue;
-      const row = box.querySelector('.zk-row[data-key="' + f.key + '"]');
+      const row = root.querySelector('.zk-row[data-key="' + f.key + '"]');
       if (!row) continue;
       if (f.type === "switch") {
         const sw = row.querySelector(".zk-switch");
@@ -1856,7 +1941,6 @@
     try {
       ensureStyles();
       ensurePanel();
-      ensureSettings();
     } catch (e) { console.error("[职行力] UI初始化异常", e); }
   }
 
@@ -1883,6 +1967,10 @@
   window.addEventListener("pagehide", flushLogs);
   window.addEventListener("beforeunload", flushLogs);
   document.addEventListener("click", () => { tryResumeAudio(); pokeDim(); tick(); });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") closeViews(); // Esc 收起日志/设置视图
+  });
+  window.addEventListener("resize", clampPanel);
 
   // 顺序关键：先把你保存的配置合并进 CFG，再渲染 UI——
   // 否则面板/设置抽屉会用默认值渲染，看起来就像"配置每次刷新都被重置"（v3.16 及之前的真实 bug）
