@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         职行力自动刷课助手
 // @namespace    https://github.com/Lan-zk
-// @version      3.18
+// @version      3.19
 // @description  自动播放和评价职行力课程。克制的辅助仪器界面（闲置淡化/可折叠微标/提示分级静默）；多讲课程收尾防循环；后台持续推进；设置抽屉免改代码；全量日志。
 // @author       Lan-zk
 // @source       https://greasyfork.org/scripts/455353
@@ -30,7 +30,7 @@
 (function () {
   "use strict";
 
-  const VERSION = "3.18";
+  const VERSION = "3.19";
   const LOG_MAX = 2500; // 日志最多保留条数（超出丢弃最旧的；抽屉里最多渲染 800 条）
 
   // ===================== 配置 =====================
@@ -974,6 +974,34 @@
   }
 
   // ---------- 媒体 ----------
+  function isPendingItem(el) {
+    return !el.classList.contains("learned") &&
+      !el.classList.contains("exam2_top") &&
+      !el.getAttribute("exepower");
+  }
+  // 站点对"已学"的判定依赖播放器的进度上报（播完后才发最后一次 100% 上报）。
+  // 该标记是否落到课件列表（learned 类名）是后续一切决策的依据。
+  function courseItemLearned(label24) {
+    return $$(".course-item").some((el) =>
+      el.classList.contains("learned") && normText(el.innerText).slice(0, 24) === label24);
+  }
+
+  // 补报：重开课件短暂播放，产生新的进度上报，直到服务端标记 learned（最多约 40s）
+  async function topupPlay(item, label24) {
+    item.click();
+    const m2 = (await waitFor(() => playingMedia(), 10000)) ? playingMedia() : null;
+    if (m2) {
+      if (CFG.muted) m2.muted = true;
+      try { if (m2.paused) await m2.play().catch(() => {}); } catch (e) {}
+      await sleep(8000); // 播 8 秒产生新上报
+      try { m2.pause(); } catch (e) {}
+    }
+    const ok = await waitFor(() => courseItemLearned(label24), 20000, 500);
+    dismissPlayerModal();
+    await waitFor(() => !$("modal-tc-video-player"), 1500);
+    return ok;
+  }
+
   function playingMedia() {
     if (!$("course-detail-page")) return null;
     // 弹窗内媒体优先；audio 兜底全局（音频可能不在 modal 中）；video 不兜底（页面存在杂散 video）
@@ -1007,10 +1035,12 @@
   }
 
   // 媒体自然播完（事件驱动，后台标签页也能及时触发）
-  // 收尾策略（v3.15 重设计）：播完一讲只关播放器弹窗、**留在课程页**，
-  // 由主循环直接挑选下一讲；只有整门课全部完成（无待学课件且无需评价）才退出课程。
-  // 旧设计"每讲退出→重进"会触发站点的「该课程需要完成学习，是否继续退出」确认框，
-  // 点"是"退出整门课再重进，造成多讲课程反复循环、甚至重播已完成的讲次。
+  // 收尾策略（v3.19 重设计）：
+  // 1. 播完后**先别关播放器**——站点的"已学"标记依赖播放器发出的最后一次 100% 进度上报，
+  //    上报常常晚于 ended 事件；立刻关播放器会掐断上报，导致这一讲永远不被标记
+  //    （实测后果：评价不被持久化、整门课卡死循环）。
+  // 2. 等服务端把该课件标记为 learned（最多 12s）；没等到就重开课件"补报"几秒进度（最多 2 次）。
+  // 3. 确认后才决策：留课程页继续下一讲，或整门完成退出。
   function onMediaEnded(media) {
     if (!inState("playing")) return; // 防重入：closing 期间忽略重复触发
     if (media) finishedMedia.add(media);
@@ -1024,32 +1054,49 @@
       record("INFO", "媒体接管时已处于播完状态，本节点不计入统计（是否完成交由站点判定）");
     }
     setState("closing");
-    lock(20000, null, "播完收尾"); // 上限 20s；链内每步检查状态，被接管时立即放弃
+    lock(120000, null, "播完收尾+完成确认"); // 确认+补报可能耗时；链内每步检查状态
     (async () => {
       try {
+        const label24 = normText(currentMediaLabel).slice(0, 24);
+
+        // 1. 保持播放器打开，等服务端确认已学（上报通常在结束后几秒内落地）
+        let confirmed = false;
+        if (label24) {
+          confirmed = await waitFor(() => courseItemLearned(label24), 12000, 500);
+          record("DBG", confirmed ? "完成已确认（服务端标记 learned）" : "完成确认超时（12s），需补报");
+        }
         if (!inState("closing")) return;
-        // 1. 只关播放器弹窗，回到课程详情页
+
+        // 2. 关播放器
         dismissPlayerModal();
         if (!(await waitFor(() => !$("modal-tc-video-player"), 2000))) {
           dismissPlayerModal(); // 兜底再点一次
           await waitFor(() => !$("modal-tc-video-player"), 1500);
         }
-        if (!inState("closing")) return; // 已被其它流程接管，放弃收尾
-
-        // 2. 稍等列表状态刷新，判断课程内是否还有事可做
-        await sleep(2500);
         if (!inState("closing")) return;
+
+        // 3. 未确认 → 补报：重开课件播放几秒，产生新的进度上报直到被标记（最多 2 次）
+        if (!confirmed && label24) {
+          for (let i = 0; i < 2 && !confirmed; i++) {
+            if (!inState("closing")) return;
+            const item = $$(".course-item").find((el) =>
+              isPendingItem(el) && normText(el.innerText).slice(0, 24) === label24);
+            if (!item) { record("DBG", "补报中止：课件已不在待学列表"); break; }
+            record("WARN", "重开课件补报进度（第 " + (i + 1) + " 次）：" + label24.slice(0, 24));
+            confirmed = await topupPlay(item, label24);
+            record("INFO", "补报结果：" + (confirmed ? "已确认 learned ✓" : "仍未确认"));
+          }
+        }
+        if (!inState("closing")) return;
+
+        // 4. 决策：留课程页继续下一讲 / 评价；整门完成才退出
         const items = $$(".course-item");
-        const pend = items.filter((el) =>
-          !el.classList.contains("learned") &&
-          !el.classList.contains("exam2_top") &&
-          !el.getAttribute("exepower"));
+        const pend = items.filter(isPendingItem);
         const pendNext = pend.filter((el) => !isDoneMarked(normText(el.innerText).slice(0, 24)));
         const needEval = items.some((el) =>
           el.classList.contains("exam2_top") && !/已评定/.test(el.innerText || ""));
 
-        // 3. 还有待学课件（或待评价）：留在课程页，主循环直接选下一个
-        if (pendNext.length || needEval) {
+        if (pendNext.length || (needEval && confirmed)) {
           record("INFO", "课程内还有 " +
             (pendNext.length ? pendNext.length + " 个待学课件" : "") +
             (pendNext.length && needEval ? "和" : "") +
@@ -1058,9 +1105,15 @@
           clearLock();
           return;
         }
+        if (needEval && !confirmed) {
+          // 只剩评价项但本讲未确认：站点会拒绝评价持久化，等补报后再来
+          noteOnce("eval-blocked", "课件未确认完成，暂缓评价（避免提交被站点丢弃）");
+          setState("idle");
+          clearLock();
+          return;
+        }
 
-        // 4. 整门课全部完成（剩余课件均处于护栏期视为已完成）才退出课程。
-        //    此时退出不会触发「是否继续退出」确认框；万一弹出，handleAlerts 兜底。
+        // 5. 整门课全部完成才退出（此时退出不会触发「是否继续退出」确认框）
         goBackFromCourse();
         let backOk = await waitFor(() => !$("course-detail-page"), 2500);
         if (!inState("closing")) return;
@@ -1390,15 +1443,21 @@
     }
 
     if (!candidates.length && pending.length) {
-      // 只剩"刚完成但还没被标已学"的课件：等状态刷新，避免整节重播。
-      // 若等太久（90s）说明服务端标记卡住，刷新页面强制同步（走熔断保护）。
+      // 只剩"刚完成但还没被标已学"的课件。播放器已关闭=上报源已断，干等不会好转：
+      // 30s 后主动重开课件补报一次；补报后仍未标记则刷新页面强制同步（走熔断保护）。
       if (!waitLearnedSince) waitLearnedSince = now();
-      noteOnce("wait-learned", "等待服务端更新完成状态（" +
-        Math.round((now() - waitLearnedSince) / 1000) + "s）");
-      setStatus("等待课时状态刷新…", Math.round((now() - waitLearnedSince) / 1000) + "s");
-      if (now() - waitLearnedSince > 90000) {
+      const waitedSec = Math.round((now() - waitLearnedSince) / 1000);
+      noteOnce("wait-learned", "等待服务端更新完成状态（" + waitedSec + "s）");
+      setStatus("等待课时状态刷新…", waitedSec + "s");
+      if (waitedSec >= 30 && waitedSec < 40) {
+        waitLearnedSince = now(); // 重置观察窗口
+        record("WARN", "重开课件补报进度：" + normText(pending[0].innerText).slice(0, 24));
+        await topupPlay(pending[0], normText(pending[0].innerText).slice(0, 24));
+        return;
+      }
+      if (waitedSec > 75) {
         waitLearnedSince = 0;
-        doReload("等待服务端更新完成状态超时（90s）");
+        doReload("完成状态反复无法确认（补报后仍未标记）");
       }
       return;
     }
@@ -1413,10 +1472,15 @@
 
     // 全部课件已学：先看是否已评定（避免重复提交评价），再决定评价或返回
     const lastItem = items[items.length - 1];
+    // 退出前先关掉残留播放器弹窗——它会挡住返回键（实测导致"返回学习页"连点 10 次无效）
+    if ($("modal-tc-video-player, .player-container")) {
+      record("DBG", "退出前发现残留播放器弹窗，先关闭");
+      dismissPlayerModal();
+    }
     if (lastItem && /已评定/.test(lastItem.innerText || "")) {
       record("INFO", "课程已完成（已评定），返回学习页");
       const back = $(".show-back-button");
-      if (back) back.click();
+      if (back) realClick(back);
       await waitFor(() => !$("course-detail-page"), 3000);
       return;
     }
@@ -1425,7 +1489,7 @@
     if (!isEvalItem) {
       record("INFO", "课件已全部完成且无需评价，返回学习页");
       const back = $(".show-back-button");
-      if (back) back.click();
+      if (back) realClick(back);
       else goBackFromCourse();
       await waitFor(() => !$("course-detail-page"), 3000);
       return;
