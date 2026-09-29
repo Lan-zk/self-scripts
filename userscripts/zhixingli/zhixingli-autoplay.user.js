@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         职行力自动刷课助手
 // @namespace    https://github.com/Lan-zk
-// @version      3.23
-// @description  自动播放和评价职行力课程。克制的辅助仪器界面；自适应倍速；后台挂起自救（低音量保活）；卡死必刷新重开；手动画中画；面板内设置与全量日志。
+// @version      3.24
+// @description  自动播放和评价职行力课程。克制的辅助仪器界面；自适应倍速；后台挂起自救；流程链 Worker 心跳驱动（后台不被节流拖慢）；卡死必刷新重开；手动画中画；面板内设置与全量日志。
 // @author       Lan-zk
 // @source       https://greasyfork.org/scripts/455353
 // @match        https://u.exexm.com/*
@@ -25,6 +25,10 @@
  *    画中画为面板手动按钮：Chrome 要求 PiP 在真实点击手势内发起，自动调用必被拒。
  * 5.5 停滞计时与续播循环解耦（v3.23）：看门狗不再被续播重置饿死；播放态也纳入
  *    全局无进展兜底——任何卡死最终都会刷新重开，绝不整夜空转。
+ * 5.6 流程链等待改由 Worker 心跳唤醒（v3.24，workerSleep）：主线程 setTimeout 在
+ *    后台被节流到 1 次/分钟，曾把收尾链的 12s 确认拖过 120s 锁、播放器无人关，
+ *    引发残留弹窗→刷新→后台加载不动→刷新循环→熔断（09:29 会话三层连锁实锤）。
+ *    后台刷新后 SPA 不渲染导航时不再白烧熔断额度：挂起计时等回前台自动继续。
  * 6. 日志与设置：均收敛在主面板内展开；全量动作/状态快照落盘（跨刷新保留），
  *    "复制排查信息"一键导出完整报告；设置即时生效并持久化，免改代码。
  *
@@ -35,7 +39,7 @@
 (function () {
   "use strict";
 
-  const VERSION = "3.23";
+  const VERSION = "3.24";
   const LOG_MAX = 2500; // 日志最多保留条数（超出丢弃最旧的；抽屉里最多渲染 800 条）
 
   // ===================== 配置 =====================
@@ -116,7 +120,9 @@
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
   const normText = (s) => String(s || "").replace(/\s+/g, "").slice(0, 80);
 
-  // 条件轮询：fn 一成立立即返回 true（替代固定盲等 sleep），超时返回 false
+  // 条件轮询：fn 一成立立即返回 true（替代固定盲等 sleep），超时返回 false。
+  // 等待用 workerSleep（Worker 心跳唤醒）：主线程 setTimeout 在后台被节流到
+  // 1 次/分钟，曾把流程链拖慢一个数量级（waitFor 的 12s 真实等了 2 分钟+）。
   async function waitFor(fn, timeoutMs, stepMs) {
     const t0 = now();
     const step = stepMs || 150;
@@ -125,7 +131,7 @@
       try { ok = !!fn(); } catch (e) {}
       if (ok) return true;
       if (now() - t0 >= timeoutMs) return false;
-      await sleep(step);
+      await workerSleep(step);
     }
   }
 
@@ -1004,12 +1010,25 @@
   }
   // 主线程的 setTimeout/setInterval 在后台标签页会降到 1 次/分钟甚至完全冻结；
   // Worker 线程的定时器宽松得多，用它来驱动 tick，尽量让脚本在后台也能推进。
+  // v3.24：流程链的等待同样由 Worker 心跳唤醒（workerSleep）——收尾/评价/补报
+  // 等多步链不再被主线程节流拖慢；唤醒点在 tick 入口（重入保护之前）与 Worker 回调。
+  const wakeWaiters = [];
+  function workerSleep(ms) {
+    return new Promise((r) => wakeWaiters.push({ at: now() + ms, r }));
+  }
+  function pumpWakes() {
+    if (!wakeWaiters.length) return;
+    const t = now();
+    for (let i = wakeWaiters.length - 1; i >= 0; i--) {
+      if (t >= wakeWaiters[i].at) wakeWaiters.splice(i, 1)[0].r();
+    }
+  }
   function startWorkerDriver() {
     try {
       const src = "let t=null;onmessage=function(e){if(e.data==='s'){if(!t){t=setInterval(function(){postMessage(0)},1000)}}else{clearInterval(t);t=null}};";
       const url = URL.createObjectURL(new Blob([src], { type: "text/javascript" }));
       const w = new Worker(url);
-      w.onmessage = () => { tick().catch(() => {}); };
+      w.onmessage = () => { pumpWakes(); tick().catch(() => {}); };
       w.postMessage("s");
       return w;
     } catch (e) { return null; } // CSP 等环境不支持时静默降级
@@ -1023,17 +1042,25 @@
 
   function dismissModal(m) {
     if (!m) return false;
-    // 策略1：标题栏返回键 / 显式关闭按钮（评价弹窗、播放器弹窗等）
-    const back =
-      m.querySelector("ion-header .back-button") ||
-      m.querySelector("button.close, .modal-close, ion-header button");
-    // 策略2：无标题栏的纯按钮弹窗（奖励弹窗等），匹配确认/取消类文字按钮；
-    // 注意不匹配"翻翻背包/保存/提交"等会跳转或提交的按钮
-    const ack = $$("button", m).find((b) =>
-      /^(我知道了|知道了|确\s*定|关\s*闭|取消|×|✕)$/i.test((b.textContent || "").trim()));
-    const btn = back || ack;
-    if (!btn) return false;
-    realClick(btn);
+    // 播放器弹窗优先走专属路径：通用 header 按钮可能是"统计/分享"等，点了无效
+    // （实测残留的音频播放器弹窗被点了 6 次都没关，直接烧掉一次自愈刷新）
+    let clicked = false;
+    if (m.querySelector(".player-container, modal-tc-video-player, .vjs-close-button")) {
+      clicked = dismissPlayerModal(m);
+    }
+    if (!clicked) {
+      // 策略1：标题栏返回键 / 显式关闭按钮（评价弹窗等）
+      const back =
+        m.querySelector("ion-header .back-button") ||
+        m.querySelector("button.close, .modal-close, ion-header button");
+      // 策略2：无标题栏的纯按钮弹窗（奖励弹窗等），匹配确认/取消类文字按钮；
+      // 注意不匹配"翻翻背包/保存/提交"等会跳转或提交的按钮
+      const ack = $$("button", m).find((b) =>
+        /^(我知道了|知道了|确\s*定|关\s*闭|取消|×|✕)$/i.test((b.textContent || "").trim()));
+      const btn = back || ack;
+      if (btn) { realClick(btn); clicked = true; }
+    }
+    if (!clicked) return false;
     touch();
     const n = (overlayAttempts.get(m) || 0) + 1;
     overlayAttempts.set(m, n);
@@ -1156,7 +1183,7 @@
     if (m2) {
       if (CFG.muted) m2.muted = true;
       try { if (m2.paused) await m2.play().catch(() => {}); } catch (e) {}
-      await sleep(8000); // 播 8 秒产生新上报
+      await workerSleep(8000); // 播 8 秒产生新上报（workerSleep：后台不被节流拖成 8 分钟）
       try { m2.pause(); } catch (e) {}
     }
     const ok = await waitFor(() => courseItemLearned(label24), 20000, 500);
@@ -1173,15 +1200,18 @@
       .find((m) => !finishedMedia.has(m)) || null;
   }
 
-  function dismissPlayerModal() {
+  function dismissPlayerModal(root) {
+    root = root || document; // 传 root 时只在该弹窗内找（弹窗治理复用本路径）
     // 关闭顺序：标题栏返回键 → 播放器左上"关闭"按钮（vjs-close-button，实测部分场景返回键无效）
-    let back = $("modal-tc-video-player ion-header button.back-button");
-    if (!back) back = $("modal-tc-video-player .vjs-close-button");
+    let back =
+      root.querySelector("modal-tc-video-player ion-header button.back-button") ||
+      root.querySelector("ion-header button.back-button") ||
+      root.querySelector(".vjs-close-button");
     if (!back) {
-      const pc = $(".player-container");
-      const root = pc ? pc.closest("ion-modal") : null;
-      if (root) back = root.querySelector("ion-header button.back-button") ||
-        root.querySelector(".vjs-close-button");
+      const pc = root.querySelector(".player-container");
+      const r = pc || root;
+      back = r.querySelector("ion-header button.back-button") ||
+        r.querySelector(".vjs-close-button");
     }
     if (back) { realClick(back); touch(); record("DBG", "点击返回（关闭播放器弹窗）"); return true; }
     record("DBG", "未找到播放器弹窗返回按钮");
@@ -1531,7 +1561,7 @@
       } else {
         // 保底停留 5 秒，确保站点记录阅读进度
         const rest = 5000 - (now() - t0);
-        if (rest > 0) await sleep(rest);
+        if (rest > 0) await workerSleep(rest);
         $(".exe-win-open-modal .back-button").click();
         await waitFor(() => !$(".exe-win-open-modal"), 3000);
       }
@@ -1596,7 +1626,7 @@
         evalRetries++;
         const m0 = pickOverlay("modal-evaluate");
         if (m0) dismissModal(m0);
-        await sleep(1000);
+        await workerSleep(1000);
         setState("idle");
         clearLock();
         if (evalRetries >= 3) { evalRetries = 0; doReload("评价弹窗缺少星级控件"); }
@@ -1633,7 +1663,7 @@
         ta.dispatchEvent(new Event("input", { bubbles: true }));
         ta.dispatchEvent(new Event("change", { bubbles: true }));
       }
-      await sleep(400); // 给 Angular 变更检测一点时间
+      await workerSleep(400); // 给 Angular 变更检测一点时间
 
       // ---- 保存：星级没选上就不提交，避免被站点拒绝（"提交失败：评分还没有完成"）----
       setState("saving");
@@ -1642,7 +1672,7 @@
         evalRetries++;
         const m1 = pickOverlay("modal-evaluate");
         if (m1) dismissModal(m1);
-        await sleep(1000);
+        await workerSleep(1000);
         setState("idle");
         clearLock();
         if (evalRetries >= 3) { evalRetries = 0; doReload("星级反复无法选中"); }
@@ -1682,7 +1712,7 @@
         warn("评价未确认完成，第 " + evalRetries + " 次重试" + (starOk ? "" : "（星级可能未选中）"));
         const m = pickOverlay("modal-evaluate") || pickOverlay("ion-modal");
         if (m) dismissModal(m);
-        await sleep(1000);
+        await workerSleep(1000);
         if (evalRetries >= 3) {
           evalRetries = 0;
           doReload("评价流程反复失败");
@@ -1909,6 +1939,7 @@
 
   // ---------- 主循环 ----------
   async function tick() {
+    pumpWakes(); // 必须在重入保护之前：流程链的 workerSleep 靠每次心跳在这里被唤醒
     if (ticking) return;
     ticking = true;
     const tickT0 = now();
@@ -1986,9 +2017,19 @@
         noteOnce("other-page", "不在学习页/课程页（" + document.title + "）");
         setStatus(maybeLogin ? "请重新登录" : "非学习页面",
           maybeLogin ? "登录后脚本自动继续" : "未找到学习页入口");
-        // 空转自愈：长时间停在既非学习页也非课程页的地方（v3.6 会在这里静默卡住）
+        // 空转自愈：长时间停在既非学习页也非课程页的地方（v3.6 会在这里静默卡住）。
+        // 例外（v3.24）：后台标签页里 SPA 不完成渲染（实测自愈刷新后页面加载拖了
+        // 6 分钟才注入脚本），底部"学习"入口根本不出现——此时刷新只是白烧熔断
+        // 额度（刷新→还是打不开→再刷新→熔断）。改为挂起计时等回前台：一回前台
+        // gotoLearnTab 立即可点；前台仍卡满 180s 才走刷新（前台刷新是有效的）。
         const stuckSec = Math.round((now() - otherPageSince) / 1000);
-        if (!maybeLogin) {
+        if (!maybeLogin && running) {
+          if (pageHiddenReal() && stuckSec > 120) {
+            setStatus("后台休眠中", "页面在后台不渲染导航，回前台自动继续");
+            noteOnce("other-page-hidden", "后台无法导航（SPA 未渲染完成），等待回前台继续（不刷新）");
+            otherPageSince = now() - 60000; // 计时挂在 60s：回前台后仍有完整观察窗再决定刷新
+            return;
+          }
           if (stuckSec > 60) {
             noteOnce("other-page-stuck", "已 " + stuckSec + "s 不在学习页/课程页，持续将自愈刷新");
           }
