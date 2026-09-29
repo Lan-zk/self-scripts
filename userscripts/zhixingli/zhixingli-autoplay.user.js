@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         职行力自动刷课助手
 // @namespace    https://github.com/Lan-zk
-// @version      3.22
-// @description  自动播放和评价职行力课程。克制的辅助仪器界面；自适应倍速防缓冲耗尽；后台持续推进（Worker 驱动/可见性+失焦伪装）；手动画中画；面板内设置与全量日志。
+// @version      3.23
+// @description  自动播放和评价职行力课程。克制的辅助仪器界面；自适应倍速；后台挂起自救（低音量保活）；卡死必刷新重开；手动画中画；面板内设置与全量日志。
 // @author       Lan-zk
 // @source       https://greasyfork.org/scripts/455353
 // @match        https://u.exexm.com/*
@@ -20,8 +20,11 @@
  * 3. 自动刷新带熔断器：10 分钟内最多 3 次，防止"刷新→又立刻刷新"死循环。
  * 4. 弹窗治理：堆叠的 ion-modal 自动清理；系统确认框按升级阶梯处理；奖励弹窗自动关闭。
  * 5. 后台运行：Web Worker 驱动 + 静音音频防节流 + 可见性/失焦伪装 + 停滞自动续播
- *    + 自适应倍速（缓冲耗尽自动降档、稳定后逐档升回）。画中画为面板手动按钮：
- *    Chrome 要求 PiP 在真实点击手势内发起，脚本自动调用必被拒（日志实锤过）。
+ *    + 自适应倍速（缓冲耗尽自动降档、稳定后逐档升回）+ 挂起自救（Chrome 会冻结隐藏
+ *    标签页里无声视频的时钟——缓冲满格却冻结：低音量出声解除，无效则刷新重开）。
+ *    画中画为面板手动按钮：Chrome 要求 PiP 在真实点击手势内发起，自动调用必被拒。
+ * 5.5 停滞计时与续播循环解耦（v3.23）：看门狗不再被续播重置饿死；播放态也纳入
+ *    全局无进展兜底——任何卡死最终都会刷新重开，绝不整夜空转。
  * 6. 日志与设置：均收敛在主面板内展开；全量动作/状态快照落盘（跨刷新保留），
  *    "复制排查信息"一键导出完整报告；设置即时生效并持久化，免改代码。
  *
@@ -32,7 +35,7 @@
 (function () {
   "use strict";
 
-  const VERSION = "3.22";
+  const VERSION = "3.23";
   const LOG_MAX = 2500; // 日志最多保留条数（超出丢弃最旧的；抽屉里最多渲染 800 条）
 
   // ===================== 配置 =====================
@@ -56,6 +59,8 @@
     antiThrottle: true,        // 挂后台时防止定时器被 Chrome 节流（静音音频，无声音）
     spoofVisibility: true,     // 伪装页面"始终可见"：阻止播放器在后台/最小化时自动暂停（本脚本核心诉求）
     spoofFocus: true,          // 失焦伪装：拦截 window blur + hasFocus() 恒真 + 失焦后立即补发合成 focus，对付"失焦即暂停"的播放器
+    audibleKeepalive: true,    // 挂起自救：后台视频时钟被浏览器冻结（缓冲满格却不走）时，解除静音+极低音量"出声"解除挂起
+    keepaliveVolume: 0.02,     // 保活音量（0.02≈近乎无声；仅挂起自救生效期间使用，回到前台即恢复静音）
     debug: false,              // true=额外在控制台实时输出（页面日志始终全量记录；DevTools 开着时控制台输出更卡，故默认关）
 
     // ---- 界面（辅助性：可淡化、可折叠、提示可静默） ----
@@ -70,7 +75,7 @@
   // 不能在这里立即执行——store/CFG 工具尚未就绪，早前版本因此启动即崩。
   const USER_KEYS = [
     "stars", "comment", "commentFallback", "playbackRate", "muted",
-    "alertPolicy", "spoofFocus", "antiThrottle", "debug",
+    "alertPolicy", "spoofFocus", "audibleKeepalive", "keepaliveVolume", "antiThrottle", "debug",
     "stuckOpenSec", "stuckPlayingSec", "stallResumeSec", "noProgressMin",
     "reloadAfterHours", "heapLimitMB", "toastLevel", "autoDim",
   ];
@@ -82,7 +87,7 @@
         const v = saved[k];
         // 类型守卫：数字键必须是有限数字，其余键非 undefined 即可
         const isNum = ["stars","playbackRate","stuckOpenSec","stuckPlayingSec",
-          "stallResumeSec","noProgressMin","reloadAfterHours","heapLimitMB"].includes(k);
+          "stallResumeSec","noProgressMin","reloadAfterHours","heapLimitMB","keepaliveVolume"].includes(k);
         if (isNum && typeof v === "number" && isFinite(v)) CFG[k] = v;
         else if (!isNum && v !== undefined) CFG[k] = v;
       }
@@ -1350,9 +1355,25 @@
     return -1;
   }
 
+  // ---------- 停滞计时与挂起自救（v3.23） ----------
+  // v3.22 教训（用户日志实锤）：续播循环每 8s 重置 lastMediaProgressAt，把 180s 看门狗
+  // 饿死，整夜空转无人救。现停滞起点独立记录（stallSince），观测到推进才清零；
+  // 看门狗以它为准——停滞反复救不活就刷新重开，绝不无限等待。
+  // 挂起机理：Chrome 冻结隐藏标签页里"无声视频"的媒体时钟（paused=false、缓冲满格、
+  // 时间不走，play() 空操作）；标签页一旦出声即豁免——故用"解除静音+极低音量"自救。
+  let stallSince = 0;       // 本次停滞起点（0=播放正常推进）
+  let stallReportAt = 0;    // 上次停滞摘要时间（日志聚合：首条 + 每 5 分钟一条，防刷屏毁现场）
+  let audibleOn = false;    // 低音量保活生效中（回到前台恢复静音）
+  let audibleTriedAt = 0;   // 上次保活尝试时间（冷却）
+  let audibleFailed = false;// 本讲保活已判定无效（多半无音轨；换课件才重试）
+  function stallMediaReset() {
+    stallSince = 0; stallReportAt = 0;
+    audibleOn = false; audibleTriedAt = 0; audibleFailed = false;
+  }
+
   function manageMedia(media) {
     if (finishedMedia.has(media)) return; // 已收尾的残留媒体，等待 DOM 移除即可
-    if (CFG.muted) media.muted = true;
+    if (CFG.muted && !audibleOn) media.muted = true; // 保活期间不回压静音
     if (CFG.playbackRate > 0 && media.playbackRate !== currentRate()) {
       try { media.playbackRate = currentRate(); } catch (e) {}
     }
@@ -1360,6 +1381,7 @@
     if (!seenMedia.has(media)) {
       seenMedia.add(media);
       rateResetForMedia(); // 新课件：倍速降档/上限状态重新开始
+      stallMediaReset();   // 新课件：停滞计时与挂起自救状态重新开始
       lastMediaTime = -1;
       lastMediaProgressAt = now();
       lastProgressLogAt = now();
@@ -1401,6 +1423,13 @@
       lastMediaProgressAt = now();
       progressedMedia.add(media); // 观测到推进：完成统计时才算"真正看过"
       touch();
+      if (stallSince) { stallSince = 0; stallReportAt = 0; } // 推进即脱离停滞
+      if (audibleOn && !pageHiddenReal()) {
+        // 回到前台：挂起风险解除，恢复静音
+        audibleOn = false;
+        if (CFG.muted) media.muted = true;
+        record("INFO", "回到前台，低音量保活结束，恢复静音");
+      }
       if (CFG.playbackRate > 1) {
         if (rateTrialFromIdx >= 0 && now() - rateLastChangeAt >= 60000) rateTrialFromIdx = -1; // 升档观察期通过
         rateMaybeUpshift(media);
@@ -1408,29 +1437,57 @@
     }
     setState("playing");
     refreshStatus();
+    if (stallSince) setStatus("进度停滞中", "已 " + Math.round((now() - stallSince) / 1000) +
+      "s（自动恢复中，反复无效将刷新重开）");
 
-    // 细粒度停滞续播：后台/最小化时播放器可能暂停推进。
-    // 与 180s 看门狗不同层：这里 15s 一查，停了就 play() 拉起（必要时换播放器大按钮）。
+    // 细粒度停滞处理：续播 + 挂起识别 + 可听化自救 + 降档（日志聚合，不刷屏）
     if (!media.paused && progressedMedia.has(media) &&
         now() - lastMediaProgressAt > CFG.stallResumeSec * 1000) {
       const ahead = bufferedAhead(media);
-      record("WARN", "进度停滞 " + CFG.stallResumeSec + "s，自动续播｜paused=" + media.paused +
-        " readyState=" + media.readyState +
-        (ahead >= 0 ? " 缓冲前瞻=" + ahead.toFixed(1) + "s" : "") +
-        (ahead === 0 ? "（缓冲已耗尽：供流跟不上倍速）" : ""));
+      const suspended = ahead >= 2 && pageHiddenReal(); // 挂起签名：缓冲充足却冻结且页面真实隐藏
+      if (!stallSince) stallSince = now();
+      // 日志聚合：每次停滞首条 WARN + 每 5 分钟一条摘要（v3.22 每 8s 一条把整晚现场冲掉了）
+      if (now() - stallReportAt > 300000) {
+        stallReportAt = now();
+        const durS = Math.round((now() - stallSince) / 1000);
+        record("WARN", "进度停滞（已持续 " + (durS < 90 ? durS + "s" : Math.round(durS / 60) + " 分钟") +
+          "）｜paused=" + media.paused + " readyState=" + media.readyState +
+          (ahead >= 0 ? " 缓冲前瞻=" + ahead.toFixed(1) + "s" : "") +
+          (ahead === 0 ? "（缓冲已耗尽：供流跟不上倍速）" :
+            suspended ? "（疑似浏览器冻结后台视频时钟）" : ""));
+      }
       const p = media.play();
       if (p && p.catch) p.catch(() => {});
       const big = $(".vjs-big-play-button");
       if (big) realClick(big);
-      lastMediaProgressAt = now() - (CFG.stallResumeSec * 500); // 给恢复半程观察窗
-      // 供流不足（缓冲见底）→ 降档；缓冲充足却冻结（后台挂起类）降档无益，不降
+      lastMediaProgressAt = now() - (CFG.stallResumeSec * 500); // 控制续播重试节奏（看门狗已不依赖它）
+      // 挂起自救：解除静音+极低音量让标签页"出声"（Chrome 豁免出声标签页的媒体冻结）
+      if (suspended && CFG.muted && !audibleOn && !audibleFailed &&
+          now() - audibleTriedAt > 60000) {
+        audibleTriedAt = now();
+        try {
+          media.muted = false;
+          media.volume = Math.min(1, Math.max(0.005, CFG.keepaliveVolume || 0.02));
+          audibleOn = true;
+          record("WARN", "挂起自救：解除静音（volume=" + media.volume + "）——出声的标签页不受浏览器后台冻结");
+        } catch (e) {}
+      } else if (audibleOn && now() - audibleTriedAt > 20000) {
+        // 出声 20s 仍未恢复：这条视频救不活（多半无音轨），恢复静音，交棒看门狗刷新重开
+        audibleOn = false;
+        audibleFailed = true;
+        try { media.muted = true; } catch (e) {}
+        record("WARN", "低音量保活未能解除挂起（视频可能无音轨），恢复静音；将由看门狗刷新重开");
+        noteOnce("pip-hint-" + normText(currentMediaLabel || "").slice(0, 12),
+          "浏览器冻结了后台视频：可点面板「画中画」悬浮播放，或等待自动刷新重试");
+      }
+      // 供流不足（缓冲见底）→ 降档；挂起/页面可见的冻结降档无益，不降
       if (CFG.playbackRate > 1 && ((ahead >= 0 && ahead < 2) || (ahead < 0 && !pageHiddenReal()))) {
         rateOnStall(media);
       }
     }
 
-    // 播放进度日志（每 60s）：证明播放持续推进、速度与暂停状态一目了然
-    if (now() - lastProgressLogAt > 60000) {
+    // 播放进度日志（每 60s；停滞期间由上面的聚合摘要负责，不重复记）
+    if (!stallSince && now() - lastProgressLogAt > 60000) {
       lastProgressLogAt = now();
       const bufS = bufferedAhead(media);
       record("DBG", "播放进度 " + fmtClock(cur) + "/" + fmtClock(media.duration) +
@@ -1438,18 +1495,19 @@
         (bufS >= 0 ? " 缓冲=" + bufS.toFixed(0) + "s" : ""));
     }
 
-    // 播放卡死检测：长时间无进度 → 大播放键恢复 → 仍不行则刷新
-    if (now() - lastMediaProgressAt > CFG.stuckPlayingSec * 1000) {
-      warn("播放无进度 " + CFG.stuckPlayingSec + "s，尝试恢复 #" + (recoveryTries + 1));
+    // 播放卡死检测：以独立停滞计时 stallSince 为准（续播循环重置 lastMediaProgressAt
+    // 不再能饿死它）——恢复尝试反复无效则刷新重开，宁可重开也不整夜空转
+    if (stallSince && now() - stallSince > CFG.stuckPlayingSec * 1000) {
+      warn("播放无进度 " + Math.round((now() - stallSince) / 1000) + "s，尝试恢复 #" + (recoveryTries + 1));
       const big = $(".vjs-big-play-button");
       if (big) big.click();
       if (media.paused) { try { media.play().catch(() => {}); } catch (e) {} }
-      lastMediaProgressAt = now(); // 给恢复手段一个观察窗口
+      stallSince = now(); // 给恢复手段一个完整观察窗口后重新计数
       if (++recoveryTries >= 3) {
         recoveryTries = 0;
-        doReload("播放卡死");
+        doReload("播放卡死（停滞反复无法恢复，刷新重开）");
       }
-    } else {
+    } else if (!stallSince) {
       recoveryTries = 0;
     }
 
@@ -1895,6 +1953,11 @@
         if (media) {
           manageMedia(media);
           handleForeignOverlays(media); // 播放期间出现的奖励/确认/残留弹窗在这里关
+          // 全局无进展兜底：原先只排在下方 tick 早退之后，播放态永远轮不到
+          // （v3.22 整夜卡死的帮凶之一）——现在播放中也检查
+          if (running && now() - lastActivity > CFG.noProgressMin * 60 * 1000) {
+            doReload("超过 " + CFG.noProgressMin + " 分钟无进展（播放中）");
+          }
           return;
         }
         setState("idle"); // 媒体消失（被手动关掉等），回到正常调度
@@ -1977,6 +2040,8 @@
       options: [["last", "点最后一个（确定类）"], ["cancel", "点取消类"], ["", "不处理（手动）"]] },
     { key: "antiThrottle", type: "switch", label: "后台防节流", tip: "静音音频防止定时器被冻结" },
     { key: "spoofFocus", type: "switch", label: "失焦伪装", tip: "拦截 blur+伪装页面焦点，防站点失焦暂停" },
+    { key: "audibleKeepalive", type: "switch", label: "低音量保活", tip: "后台视频被浏览器冻结时，短暂解除静音自救" },
+    { key: "keepaliveVolume", type: "number", min: 0.01, max: 0.5, step: 0.01, label: "保活音量", tip: "0.02≈近乎无声" },
     { sec: "阈值（进阶）" },
     { key: "stallResumeSec", type: "number", min: 10, max: 120, step: 5, label: "停滞续播", tip: "秒，进度停多久自动拉起" },
     { key: "stuckPlayingSec", type: "number", min: 60, max: 600, step: 30, label: "播放卡死判定", tip: "秒，超过则尝试恢复/刷新" },
