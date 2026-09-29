@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         职行力自动刷课助手
 // @namespace    https://github.com/Lan-zk
-// @version      3.24
-// @description  自动播放和评价职行力课程。克制的辅助仪器界面；自适应倍速；后台挂起自救；流程链 Worker 心跳驱动（后台不被节流拖慢）；卡死必刷新重开；手动画中画；面板内设置与全量日志。
+// @version      3.25
+// @description  自动播放和评价职行力课程。克制的辅助仪器界面；自适应倍速；后台挂起自救（保活音源+低音量）；后台等待不烧熔断；卡死刷新重开；手动画中画；面板内设置与全量日志。
 // @author       Lan-zk
 // @source       https://greasyfork.org/scripts/455353
 // @match        https://u.exexm.com/*
@@ -29,6 +29,11 @@
  *    后台被节流到 1 次/分钟，曾把收尾链的 12s 确认拖过 120s 锁、播放器无人关，
  *    引发残留弹窗→刷新→后台加载不动→刷新循环→熔断（09:29 会话三层连锁实锤）。
  *    后台刷新后 SPA 不渲染导航时不再白烧熔断额度：挂起计时等回前台自动继续。
+ * 5.7（v3.25）三处补漏：保活 WAV 改近无声非零采样（全零不算"出声"，无音轨课件
+ *    视频的时钟冻结只能靠标签页出声豁免）；后台弹窗动画不执行时先 dismiss
+ *    (animated:false) 再直接摘 DOM（不再烧自愈刷新）；后台等待改粘性模式——
+ *    此前计时被挂在 60~120s 区间，其余 tick 仍走到全局看门狗，"12 分钟无进展"
+ *    照样放血（实测循环刷新 5 次直至熔断）。
  * 6. 日志与设置：均收敛在主面板内展开；全量动作/状态快照落盘（跨刷新保留），
  *    "复制排查信息"一键导出完整报告；设置即时生效并持久化，免改代码。
  *
@@ -39,7 +44,7 @@
 (function () {
   "use strict";
 
-  const VERSION = "3.24";
+  const VERSION = "3.25";
   const LOG_MAX = 2500; // 日志最多保留条数（超出丢弃最旧的；抽屉里最多渲染 800 条）
 
   // ===================== 配置 =====================
@@ -308,6 +313,7 @@
   let lastBeat = now();          // 状态快照节流（每 20s 一条）
   let lastSlowWarnAt = 0;        // 卡顿告警节流
   let otherPageSince = 0;        // 进入"非学习页/课程页"的起始时间（空转自愈用）
+  let hiddenWaitActive = false;  // 后台等待回前台模式（v3.25：隐藏期间抑制一切自愈刷新）
   let enterTries = 0;            // 学习卡片点击未跳转的连续次数
   let openTries = 0;             // 课件打开失败的连续次数
   let lastTickAt = now();        // 上一次 tick 的时间（停顿检测用）
@@ -369,7 +375,9 @@
     return a;
   }
   function safeToReload() { return recentReloads().length < CFG.maxReloadsPer10min; }
+  let lastReloadAt = 0; // doReload 防抖（实测同一秒曾连发 3 次"12分钟无进展"）
   function doReload(reason) {
+    if (now() - lastReloadAt < 5000) return; // 防抖：多条看门狗可能同时到期限
     if (!safeToReload()) {
       running = false;
       store.set("running", false);
@@ -379,6 +387,7 @@
       notify("⚠ 熔断：10分钟内自动刷新达上限（" + reason + "），已停机，请人工检查", "fatal");
       return;
     }
+    lastReloadAt = now(); // 提交刷新：5s 内后续 doReload 一律跳过
     const a = recentReloads();
     a.push(now());
     store.set("reloads", a);
@@ -863,8 +872,11 @@
     startSilentAudio(); // 静音保活被拦截时（无手势），借这次点击重试
   }
 
-  // ---------- 静音保活：让标签页被 Chrome 视为"正在播放音频"，尽量避免后台冻结 ----------
-  // 生成 1 秒全零采样（8-bit 静音）的 WAV，循环播放——没有任何声音、不发起网络请求。
+  // ---------- 近无声保活音源：让标签页真正"正在播放音频" ----------
+  // 目的：Chrome 冻结隐藏标签页里"无声视频"的媒体时钟，但豁免出声的标签页。
+  // 关键（14:05 报告实锤）：全零采样的 WAV 不被 Chrome 认定为出声——标签页拿不到
+  // 豁免；且这批课件视频本身无音轨（解除静音也无效），唯一出路是独立音源让标签页
+  // 出声。±3/128（约 -33dB）人耳实际听不见，但足以越过浏览器的静音判定。
   let silentAudio = null;
   function startSilentAudio() {
     if (silentAudio) {
@@ -872,7 +884,7 @@
       return;
     }
     try {
-      const sr = 8000, n = sr; // 1 秒静音
+      const sr = 8000, n = sr; // 1 秒循环
       const buf = new Uint8Array(44 + n);
       const dv = new DataView(buf.buffer);
       const w = (o, s) => { for (let i = 0; i < s.length; i++) buf[o + i] = s.charCodeAt(i); };
@@ -881,7 +893,9 @@
       dv.setUint32(24, sr, true); dv.setUint32(28, sr, true);
       dv.setUint16(32, 1, true); dv.setUint16(34, 8, true);
       w(36, "data"); dv.setUint32(40, n, true);
-      buf.fill(128, 44); // 8-bit PCM 静音值 = 128
+      for (let i = 0; i < n; i++) { // 近无声 220Hz 正弦（±3/128），非全零才"出声"
+        buf[44 + i] = 128 + Math.round(3 * Math.sin(2 * Math.PI * 220 * i / sr));
+      }
       const url = URL.createObjectURL(new Blob([buf], { type: "audio/wav" }));
       const a = new Audio(url);
       a.loop = true;
@@ -1060,13 +1074,37 @@
       const btn = back || ack;
       if (btn) { realClick(btn); clicked = true; }
     }
-    if (!clicked) return false;
+    if (!clicked) {
+      // 找不到可点按钮：后台直接摘 DOM，前台返回 false 交由上层处理
+      if (pageHiddenReal() && m.isConnected) {
+        try {
+          m.remove();
+          record("WARN", "后台弹窗无按钮可点，直接移除 DOM");
+          return true;
+        } catch (e) {}
+      }
+      return false;
+    }
     touch();
     const n = (overlayAttempts.get(m) || 0) + 1;
     overlayAttempts.set(m, n);
     if (n === 3) {
       record("WARN", "弹窗连续 3 次点击关闭仍存在：「" +
         (m.textContent || "").replace(/\s+/g, "").slice(0, 30) + "」");
+    }
+    // 后台点关不掉：Ionic 关闭动画依赖 rAF/过渡，隐藏标签页里永远不完成
+    //（14:05 报告实锤两起，各烧掉一次自愈刷新）。先试 dismiss(animated:false)
+    // 绕过动画，仍不行直接摘 DOM（站点内存态可能残留，但比烧刷新划算）。
+    if (pageHiddenReal() && n >= 2 && m.isConnected) {
+      try { if (m.dismiss) m.dismiss(null, null, { animated: false }); } catch (e) {}
+      if (n >= 3) {
+        try {
+          m.remove();
+          record("WARN", "后台弹窗动画不执行，已直接移除 DOM：「" +
+            (m.textContent || "").replace(/\s+/g, "").slice(0, 24) + "」");
+          return true;
+        } catch (e) {}
+      }
     }
     if (n >= 6) {
       // 残留弹窗关不掉会一直空转（实测曾空转 60 秒）：自愈刷新（走熔断保护）
@@ -2000,10 +2038,12 @@
       // 5. 页面分发
       if ($("course-detail-page")) {
         otherPageSince = 0;
+        hiddenWaitActive = false;
         chainRan = true;
         await handleCourseDetail();
       } else if ($("page-learn")) {
         otherPageSince = 0;
+        hiddenWaitActive = false;
         chainRan = true;
         await handleLearnPage();
       } else {
@@ -2018,25 +2058,32 @@
         setStatus(maybeLogin ? "请重新登录" : "非学习页面",
           maybeLogin ? "登录后脚本自动继续" : "未找到学习页入口");
         // 空转自愈：长时间停在既非学习页也非课程页的地方（v3.6 会在这里静默卡住）。
-        // 例外（v3.24）：后台标签页里 SPA 不完成渲染（实测自愈刷新后页面加载拖了
-        // 6 分钟才注入脚本），底部"学习"入口根本不出现——此时刷新只是白烧熔断
-        // 额度（刷新→还是打不开→再刷新→熔断）。改为挂起计时等回前台：一回前台
-        // gotoLearnTab 立即可点；前台仍卡满 180s 才走刷新（前台刷新是有效的）。
+        // 后台例外（v3.24）：后台标签页里 SPA 不完成渲染，底部"学习"入口不出现，
+        // 刷新只是白烧熔断额度，挂起计时等回前台。
+        // v3.25 修正：v3.24 只在 stuckSec>120 时 return，计时被挂在 60~120s 区间后
+        // 其余 tick 仍会走到全局看门狗——"超过 12 分钟无进展"照样刷新（日志实锤
+        // 循环 5 次直到熔断）。改为粘性等待：一旦判定后台等待，隐藏期间每拍都
+        // return；回前台才退出并恢复正常观察/刷新。
         const stuckSec = Math.round((now() - otherPageSince) / 1000);
         if (!maybeLogin && running) {
-          if (pageHiddenReal() && stuckSec > 120) {
-            setStatus("后台休眠中", "页面在后台不渲染导航，回前台自动继续");
-            noteOnce("other-page-hidden", "后台无法导航（SPA 未渲染完成），等待回前台继续（不刷新）");
-            otherPageSince = now() - 60000; // 计时挂在 60s：回前台后仍有完整观察窗再决定刷新
-            return;
-          }
-          if (stuckSec > 60) {
-            noteOnce("other-page-stuck", "已 " + stuckSec + "s 不在学习页/课程页，持续将自愈刷新");
-          }
-          if (stuckSec > 180) {
-            otherPageSince = 0;
-            doReload("长时间不在学习页/课程页（" + (document.title || "未知页面") + "）");
-            return;
+          if (pageHiddenReal()) {
+            if (stuckSec > 120) hiddenWaitActive = true;
+            if (hiddenWaitActive) {
+              setStatus("后台休眠中", "页面在后台不渲染导航，回前台自动继续");
+              noteOnce("other-page-hidden", "后台无法导航（SPA 未渲染完成），等待回前台继续（不刷新）");
+              otherPageSince = now() - 60000; // 回前台后仍有完整观察窗再决定刷新
+              return;
+            }
+          } else {
+            hiddenWaitActive = false;
+            if (stuckSec > 60) {
+              noteOnce("other-page-stuck", "已 " + stuckSec + "s 不在学习页/课程页，持续将自愈刷新");
+            }
+            if (stuckSec > 180) {
+              otherPageSince = 0;
+              doReload("长时间不在学习页/课程页（" + (document.title || "未知页面") + "）");
+              return;
+            }
           }
         }
       }
