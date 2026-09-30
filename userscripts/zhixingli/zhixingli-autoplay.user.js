@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         职行力自动刷课助手
 // @namespace    https://github.com/Lan-zk
-// @version      3.25
+// @version      3.26
 // @description  自动播放和评价职行力课程。克制的辅助仪器界面；自适应倍速；后台挂起自救（保活音源+低音量）；后台等待不烧熔断；卡死刷新重开；手动画中画；面板内设置与全量日志。
 // @author       Lan-zk
 // @source       https://greasyfork.org/scripts/455353
@@ -44,7 +44,7 @@
 (function () {
   "use strict";
 
-  const VERSION = "3.25";
+  const VERSION = "3.26";
   const LOG_MAX = 2500; // 日志最多保留条数（超出丢弃最旧的；抽屉里最多渲染 800 条）
 
   // ===================== 配置 =====================
@@ -318,6 +318,16 @@
   let openTries = 0;             // 课件打开失败的连续次数
   let lastTickAt = now();        // 上一次 tick 的时间（停顿检测用）
   let waitLearnedSince = 0;      // "等待服务端更新完成状态"的起始时间（超时自愈用）
+  let topupIdleLabel = "";       // idle 态补报计数对应的课件标签
+  let topupIdleCount = 0;        // idle 态同课件补报次数（超限刷新强制同步，防无限循环）
+  let coursePageEl = null;       // 当前课程页元素（元素变化 = 重新进入课程页）
+  let courseEnterAt = 0;         // 本次进入课程页时间（列表 learned 类名渲染延迟，稳定期内不做完成判定）
+  let currentCourseLabel = "";   // 最近进入的课程标签（评价防重护栏用）
+  let rateGuardLogAt = 0;        // 倍速夺回日志聚合（首条 + 每 5 分钟一条）
+  let rateGuardBurst = 0;        // 本秒倍速夺回次数（ratechange 事件风暴退避）
+  let rateGuardBurstAt = 0;
+  let rateProbeAt = 0;           // 实测推进速率探针：上次采样时间与媒体位置
+  let rateProbeCur = 0;
 
   // ---------- 防重播护栏（多条） ----------
   // 多讲课程里播完一讲后，服务端把该讲标记为"已学"可能有延迟；
@@ -335,6 +345,25 @@
   function isDoneMarked(label) {
     if (!label) return false;
     return store.get("doneMarks", []).some((m) => m && m.label === label && now() - m.at < DONE_TTL);
+  }
+
+  // 评价防重护栏：同课程 30 分钟内不重复提交评价。
+  // 起因（v3.26 日志实锤）：刚进课程页时课件列表的 learned 类名有渲染延迟，短暂显示
+  // "全部已学"，脚本误判为课程完成直接评价；补报失败重进课程页后又评了一次——
+  // 同一门课被评两次。站点视角这是异常行为，必须挡住。
+  const EVAL_TTL = 1800000;
+  const EVAL_MAX = 10;
+  function markEvalDone(label) {
+    if (!label) return;
+    let arr = store.get("evalMarks", []);
+    if (!Array.isArray(arr)) arr = [];
+    arr = arr.filter((m) => m && now() - m.at < EVAL_TTL && m.label !== label);
+    arr.push({ label: label.slice(0, 24), at: now() });
+    store.set("evalMarks", arr.slice(-EVAL_MAX));
+  }
+  function isEvalMarked(label) {
+    if (!label) return false;
+    return store.get("evalMarks", []).some((m) => m && m.label === label && now() - m.at < EVAL_TTL);
   }
   const seenMedia = new WeakSet();     // 已挂 ended 监听的媒体元素
   const finishedMedia = new WeakSet(); // 已走完"播完收尾"流程的媒体元素（防重复计数/误退出）
@@ -1215,16 +1244,33 @@
   }
 
   // 补报：重开课件短暂播放，产生新的进度上报，直到服务端标记 learned（最多约 40s）
+  // v3.26 加固（日志实锤）：本环境播放器首开经常 >15s，原 10s 等待窗口内 media 未出现
+  // 就静默放弃——补报从未真正播过一秒。现等 25s、未见媒体记日志；媒体出现后若站点
+  // 未续播到尾部（从头播 8s 只能报 8s 进度），seek 到结尾前 3s 播放，强制触发 100% 上报。
   async function topupPlay(item, label24) {
     item.click();
-    const m2 = (await waitFor(() => playingMedia(), 10000)) ? playingMedia() : null;
-    if (m2) {
+    const m2 = (await waitFor(() => playingMedia(), 25000)) ? playingMedia() : null;
+    if (!m2) {
+      record("WARN", "补报：重开课件后 25s 内未见媒体（播放器未起播），本周期放弃等待确认");
+    } else {
       if (CFG.muted) m2.muted = true;
-      try { if (m2.paused) await m2.play().catch(() => {}); } catch (e) {}
+      try {
+        const d = m2.duration;
+        if (isFinite(d) && d > 8 && m2.currentTime < d - 4) {
+          try { m2.currentTime = Math.max(0, d - 3); } catch (e) {}
+        }
+        if (m2.paused) await m2.play().catch(() => {});
+      } catch (e) {}
       await workerSleep(8000); // 播 8 秒产生新上报（workerSleep：后台不被节流拖成 8 分钟）
       try { m2.pause(); } catch (e) {}
     }
     const ok = await waitFor(() => courseItemLearned(label24), 20000, 500);
+    if (!ok) {
+      // 条目现场快照：确认"未标 learned"是服务端状态而非 DOM 匹配问题
+      const it = $$(".course-item").find((el) => normText(el.innerText).slice(0, 24) === label24);
+      if (it) record("DBG", "补报后条目仍未标 learned：class=「" + (it.className || "") +
+        "」文本=「" + normText(it.innerText).slice(0, 30) + "」");
+    }
     dismissPlayerModal();
     await waitFor(() => !$("modal-tc-video-player"), 1500);
     return ok;
@@ -1454,7 +1500,26 @@
       lastMediaProgressAt = now();
       lastProgressLogAt = now();
       openTries = 0; // 播放器已出现，重置"打不开"计数
+      rateProbeAt = 0; rateProbeCur = 0; // 实测速率探针随新课件重置
       media.addEventListener("ended", () => onMediaEnded(media));
+      // 倍速保卫（v3.26）：站点播放器会监听 ratechange 把倍速重置回自己的状态
+      // （实测：脚本每拍设 16x、站点间隙打回 1x，净效果 1x——60 分钟的课播了
+      // 59 分钟，日志采样恰在设置后显示 ×16 完全无察觉）。此处即时夺回；
+      // 真实推进速率以进度日志"实际≈"为准。
+      media.addEventListener("ratechange", () => {
+        if (CFG.playbackRate <= 0) return;
+        const want = currentRate();
+        if (Math.abs((media.playbackRate || 1) - want) < 0.01) return; // 已是期望值（自己设的）
+        if (now() - rateGuardBurstAt > 1000) { rateGuardBurstAt = now(); rateGuardBurst = 0; }
+        if (++rateGuardBurst > 8) return; // 拉锯风暴退避：本秒让步，manageMedia 下拍再设
+        const foreign = media.playbackRate;
+        try { media.playbackRate = want; } catch (e) {}
+        if (now() - rateGuardLogAt > 300000) {
+          rateGuardLogAt = now();
+          record("WARN", "站点播放器持续重置倍速为 " + foreign + "x（已自动夺回 " + want +
+            "x）；真实推进速率以进度日志「实际≈」为准");
+        }
+      });
       const dt = lastOpenClickAt ? ((now() - lastOpenClickAt) / 1000).toFixed(1) + "s" : "?";
       record("INFO", "开始播放（点击到接管 " + dt + "）" +
         (currentMediaLabel ? "：" + currentMediaLabel.slice(0, 30) : ""));
@@ -1558,8 +1623,17 @@
     if (!stallSince && now() - lastProgressLogAt > 60000) {
       lastProgressLogAt = now();
       const bufS = bufferedAhead(media);
+      // 实测推进速率：两次进度日志间媒体位置增量 / 墙上时间。playbackRate 属性
+      // 在"脚本设速↔站点打回"拉锯中每拍都显示期望值，只有实测值不会说谎。
+      let effTxt = "";
+      if (rateProbeAt && now() > rateProbeAt && cur > rateProbeCur) {
+        const eff = (cur - rateProbeCur) / ((now() - rateProbeAt) / 1000);
+        effTxt = " 实际≈" + eff.toFixed(1) + "x";
+        if (CFG.playbackRate > 1 && eff < currentRate() * 0.5) effTxt += "（倍速被拖低！）";
+      }
+      rateProbeAt = now(); rateProbeCur = cur;
       record("DBG", "播放进度 " + fmtClock(cur) + "/" + fmtClock(media.duration) +
-        " ×" + media.playbackRate + (media.paused ? "（暂停中）" : "") +
+        " ×" + media.playbackRate + effTxt + (media.paused ? "（暂停中）" : "") +
         (bufS >= 0 ? " 缓冲=" + bufS.toFixed(0) + "s" : ""));
     }
 
@@ -1740,6 +1814,7 @@
         setState("backing");
         const back = $(".show-back-button");
         if (back) realClick(back);
+        markEvalDone(currentCourseLabel); // 评价防重：30 分钟内不再对本课程提交评价
         stats.courses++;
         store.set("stats", stats);
         notify("✓ 课程评价完成（累计 " + stats.courses + " 课）", "ok");
@@ -1765,6 +1840,11 @@
   // ---------- 页面处理 ----------
   async function handleCourseDetail() {
     enterTries = 0; // 已成功到达课程页，重置"进入重试"计数
+    // 记录（重新）进入课程页的时刻：课件列表的 learned 类名渲染有延迟，刚进页面
+    // 可能短暂显示"全部已学"——稳定期内不做完成判定（v3.26：曾因此一进页面就评价，
+    // 补报失败重进后又评了一次，同一门课被评两次）
+    const cpage = $("course-detail-page");
+    if (cpage && cpage !== coursePageEl) { coursePageEl = cpage; courseEnterAt = now(); }
     const media = playingMedia();
     if (media) { manageMedia(media); return; }
 
@@ -1806,20 +1886,25 @@
 
     if (!candidates.length && pending.length) {
       // 只剩"刚完成但还没被标已学"的课件。播放器已关闭=上报源已断，干等不会好转：
-      // 30s 后主动重开课件补报一次；补报后仍未标记则刷新页面强制同步（走熔断保护）。
+      // 30s 后主动重开课件补报一次；同课件补报 3 次仍不标记则刷新页面强制同步（走熔断保护）。
+      // v3.26：原逻辑每轮补报前重置计时，">75s 刷新"分支永远到不了——曾无限循环
+      // （每分钟重开一次播放器，挂多久都不前进）。
       if (!waitLearnedSince) waitLearnedSince = now();
       const waitedSec = Math.round((now() - waitLearnedSince) / 1000);
       noteOnce("wait-learned", "等待服务端更新完成状态（" + waitedSec + "s）");
       setStatus("等待课时状态刷新…", waitedSec + "s");
       if (waitedSec >= 30 && waitedSec < 40) {
         waitLearnedSince = now(); // 重置观察窗口
-        record("WARN", "重开课件补报进度：" + normText(pending[0].innerText).slice(0, 24));
-        await topupPlay(pending[0], normText(pending[0].innerText).slice(0, 24));
+        const lbl = normText(pending[0].innerText).slice(0, 24);
+        if (topupIdleLabel !== lbl) { topupIdleLabel = lbl; topupIdleCount = 0; }
+        if (++topupIdleCount > 3) {
+          topupIdleCount = 0;
+          doReload("完成状态反复无法确认（补报 3 次仍未标记，刷新强制同步）");
+          return;
+        }
+        record("WARN", "重开课件补报进度（第 " + topupIdleCount + " 次）：" + lbl);
+        await topupPlay(pending[0], lbl);
         return;
-      }
-      if (waitedSec > 75) {
-        waitLearnedSince = 0;
-        doReload("完成状态反复无法确认（补报后仍未标记）");
       }
       return;
     }
@@ -1829,6 +1914,13 @@
       noteOnce("unknown-" + normText(first.innerText).slice(0, 24),
         "存在无法识别的课件：" + normText(first.innerText).slice(0, 40));
       setStatus("存在无法识别的课件", normText(first.innerText).slice(0, 24));
+      return;
+    }
+
+    // 列表稳定期：进入课程页 5s 内不做"全部已学"判定（learned 类名渲染延迟，
+    // 误判会导致过早评价）。期间下拍（1s）自动复查，列表稳定后自然放行。
+    if (now() - courseEnterAt < 5000) {
+      setStatus("课程页加载中", "确认课件列表状态…");
       return;
     }
 
@@ -1856,6 +1948,14 @@
       await waitFor(() => !$("course-detail-page"), 3000);
       return;
     }
+    if (isEvalMarked(currentCourseLabel)) {
+      // 评价防重护栏：30 分钟内已评价过本课程，直接返回学习页（避免重复提交）
+      record("INFO", "本课程 30 分钟内已评价过（防重护栏），跳过评价返回学习页");
+      const back = $(".show-back-button");
+      if (back) realClick(back); else goBackFromCourse();
+      await waitFor(() => !$("course-detail-page"), 3000);
+      return;
+    }
     return runEvaluate(lastItem);
   }
 
@@ -1872,6 +1972,7 @@
     if (cards.length) {
       setState("entering");
       enterTries++;
+      currentCourseLabel = normText(cards[0].innerText).slice(0, 24); // 评价防重护栏的键
       record("DBG", "点击学习卡片（第 " + enterTries + " 次尝试）：进入课程：" +
         normText(cards[0].innerText).slice(0, 24));
       if (enterTries >= 4) {
