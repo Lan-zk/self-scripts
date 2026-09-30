@@ -51,7 +51,7 @@
   const CFG = {
     interval: 1000,            // 轮询间隔（毫秒）。全部步骤为条件轮询，小间隔=衔接更快
     muted: true,               // 自动静音视频/音频（也用于刷新后恢复自动播放）
-    playbackRate: 0,           // 0=不干预倍速；设为 2/3/4… 强制设定，供流不足时自动降档、稳定后升回（风控自行评估）
+    playbackRate: 0,           // 0=不干预倍速（推荐：交给外部倍速扩展，脚本零冲突）；设为 2/3/4… 强制设定并从站点重置中夺回，供流不足时自动降档、稳定后升回
     stars: 5,                  // 评价星级（1~5）
     comment: "",  // 评价评语
     commentFallback: "很好，讲的不错", // comment 为空且首次保存失败时，重试用该评语
@@ -2222,7 +2222,7 @@
     { key: "comment", type: "text", label: "评价评语", tip: "留空=不填评语" },
     { key: "commentFallback", type: "text", label: "重试评语", tip: "首次保存失败后重试时使用" },
     { sec: "播放" },
-    { key: "playbackRate", type: "number", min: 0, max: 16, step: 1, label: "强制倍速", tip: "0=不干预；供流不足时自动降档" },
+    { key: "playbackRate", type: "number", min: 0, max: 16, step: 1, label: "强制倍速", tip: "推荐 0=不干预，倍速交给外部扩展管理；>0 时脚本强制并从站点重置中夺回" },
     { key: "muted", type: "switch", label: "自动静音", tip: "关闭会有声音" },
     { sec: "自动化" },
     { key: "alertPolicy", type: "select", label: "确认框处理", tip: "系统弹窗点哪个按钮",
