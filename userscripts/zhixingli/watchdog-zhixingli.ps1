@@ -117,7 +117,10 @@ function Restart-Browser([string]$why) {
 $uNow = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
 $pages = @()
 try {
-  $tabs = @(Invoke-RestMethod -Uri ("http://127.0.0.1:{0}/json" -f $Port) -TimeoutSec 5)
+  # 注意：不要用 @() 包裹 Invoke-RestMethod——PS5.1 下顶层数组会被包成单元素嵌套数组，
+  # 成员枚举让过滤/匹配全部静默失效（实测）。裸赋值拿到平铺数组。
+  $tabs = Invoke-RestMethod -Uri ("http://127.0.0.1:{0}/json" -f $Port) -TimeoutSec 5
+  if ($tabs -is [array] -and $tabs.Count -eq 1 -and $tabs[0] -is [array]) { $tabs = $tabs[0] } # 双保险
   $pages = @($tabs | Where-Object { $_.type -eq "page" -and $_.url -like "*u.exexm.com*" })
 } catch {}
 
@@ -135,8 +138,9 @@ if ($hb) {
   $st.sawHbSinceRestart = $true
   $age = $uNow - $hb.epoch
   if ($hb.flag -eq "halt") {
-    # 熔断停机（mode 已是 stop，但必须先于 stop 分支判断）：重启无解，叫人
-    Send-Toast "halt" "脚本已熔断停机，需人工处理（面板有状态说明）"
+    # 熔断停机（mode 已是 stop，但必须先于 stop 分支判断）：v3.28 起脚本会自动复跑
+    # （冷却 15 分钟 + 网络可达，最多 5 次）；持续收到本通知才是真的需要人工。
+    Send-Toast "halt" "脚本已熔断，将自动复跑（最多 5 次）；反复出现请人工检查（面板有状态说明）"
   } elseif ($hb.flag -eq "login") {
     Send-Toast "login" "登录已过期：请在专用浏览器重新登录，脚本会自动继续"
   } elseif ($hb.mode -eq "stop") {

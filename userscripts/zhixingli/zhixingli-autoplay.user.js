@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         职行力自动刷课助手
 // @namespace    https://github.com/Lan-zk
-// @version      3.27
+// @version      3.29
 // @description  自动播放和评价职行力课程。克制的辅助仪器界面；自适应倍速；后台挂起自救（保活音源+低音量）；后台等待不烧熔断；卡死刷新重开；手动画中画；面板内设置与全量日志。
 // @author       Lan-zk
 // @source       https://greasyfork.org/scripts/455353
@@ -37,6 +37,29 @@
  * 5.8（v3.27）Worker 死亡自愈：主线程每拍检查 Worker 心跳，丢失 65s 即 terminate
  *    重建——Worker 中途死掉不再静默退化为"后台 1 次/分钟"的节流模式（那正是
  *    v3.24 修掉的连锁故障根源）。
+ * 5.9（v3.28）网络中断自愈：自愈刷新前先探测本站可达性（fetch favicon，404 也算
+ *    可达，仅网络层失败算断网）——断网时推迟刷新、每 20s 复探，恢复后才执行
+ *    （不烧熔断额度；此前断网场景 3 次/10 分钟额度照烧，熔断后 running=false
+ *    持久化，网络半夜恢复也无人拉起，一夜全废）。熔断同样自动复跑：冷却 15 分钟
+ *    +探测可达 → 自动恢复运行（最多 5 次，之后真停 + 页外监督者系统通知叫人）。
+ *    媒体 error 事件（网络/解码）60 秒内 2 次即快速刷新恢复，不再等 180s 看门狗。
+ * 5.10（v3.29）并入平行分支 v3.61 的实战补强（另一台机器上独立演进、各自踩坑，
+ *    注释中的日志实录均来自该分支）：
+ *    a) 恢复成本阶梯：前挪 < 重开课件 < 退出课程重进(exitCourseForRecovery 软恢复，
+ *       实测刷新约一半概率落到站点启动失败页) < 缓存穿透刷新(zkbust) < 普通刷新 < 熔断；
+ *    b) 缺数据型停滞分层：waiting 4s 快速前挪（不等 15s）；数据充足冻结走
+ *       前挪→跳缓冲区→刷新阶梯；缓冲末端 90s 不增长=CDN 停止下发分片→重开课件，
+ *       同课件 3 次→跳过 12h（实测"一小时只推进 38 秒"即此症）；
+ *    c) 假用户活动：每 90s 注入 mousemove（服务端按活跃决定是否继续供流）；
+ *    d) pause 拦截三件套：原型级 pause 吞掉 + pause 事件 0.5s 快速拉起 + blur
+ *       注册吞咽（覆写 addEventListener，不受注册顺序影响）；
+ *    e) 播放位置回拨检测（站点防作弊重对齐的典型特征）；
+ *    f) 重载风暴保护（站点自身疯狂重载时暂停自动刷新，不白烧熔断）；
+ *    g) 跳过清单体系：解码失败(error 3/4)跳课件 12h、打开失败暂缓 30min、
+ *       评价反复失败课程挂起 10min——不再和站点硬碰；
+ *    h) 登录态真判定（localStorage.loginInfo + 密码框）+ 疑似过期先穿透刷新复核；
+ *       click-block 遮罩看门狗（遮罩常驻会吞掉所有点击）；
+ *    i) 单实例守卫 __zkBooted（TM 与页外工具双注入时先到者生效）。
  * 7. 页面外监督者（v3.27）：心跳写入 document.title（5s 粒度，格式
  *    职行力|run/stop|state或login|unix秒），watchdog-zhixingli.ps1 经专用实例的
  *    CDP /json 轮询标题。整页冻结/浏览器崩溃这类"页面内代码无法感知自己已死"的
@@ -52,7 +75,12 @@
 (function () {
   "use strict";
 
-  const VERSION = "3.27";
+  // 单文档单实例（v3.61 并入）：Tampermonkey 注入与页外工具的兜底注入可能命中
+  // 同一文档，两个实例会互相抢点击、抢刷新（表现为"播放器永远打不开"）。先到者生效。
+  if (window.__zkBooted) return;
+  window.__zkBooted = true;
+
+  const VERSION = "3.29";
   const LOG_MAX = 2500; // 日志最多保留条数（超出丢弃最旧的；抽屉里最多渲染 800 条）
 
   // ===================== 配置 =====================
@@ -71,7 +99,7 @@
     noProgressMin: 12,         // 整体多久无任何进展就自愈刷新（分钟）
     reloadAfterHours: 3,       // 连续运行该时长后，择机（回到学习页空档）刷新释放内存；0=关闭
     heapLimitMB: 2000,         // JS 堆超过该 MB 数择机刷新（仅 Chrome 可感知；0=关闭）
-    maxReloadsPer10min: 3,     // 熔断：10 分钟滚动窗口内最多自动刷新次数
+    maxReloadsPer10min: 5,     // 熔断：10 分钟滚动窗口内最多自动刷新次数（v3.61 实战值；软恢复+断网探测已大幅降低烧额度的场景）
     alertPolicy: "last",       // 系统确认框处理："last"=点最后一个按钮 / "cancel"=点取消 / null=不处理
     antiThrottle: true,        // 挂后台时防止定时器被 Chrome 节流（静音音频，无声音）
     spoofVisibility: true,     // 伪装页面"始终可见"：阻止播放器在后台/最小化时自动暂停（本脚本核心诉求）
@@ -311,6 +339,34 @@
   let consecutiveErrors = 0;
   let evalRetries = 0;
   let recoveryTries = 0;
+  // 冻结阶梯（v3.61 并入）：数据充足但进度冻结时的升级处置（前挪→跳入缓冲区→自愈刷新）
+  let freezeStrikes = 0;
+  let lastStallPos = -1;
+  let lastTickPos = -1;         // 上一拍播放位置（回拨检测：站点防作弊重对齐的典型特征）
+  let noDataSince = 0;          // 缓冲末端停止增长的起点（缺数据型卡死判定：CDN 停止下发分片）
+  let noDataBufEnd = -1;
+  let reenterTried = false;     // 已尝试"退出课程重进"软恢复（播放器出现后复位）
+  let pendingZeroSince = 0;     // 课件列表首次观察到"全部已学"的时刻（6s 持续确权）
+  // 播完收尾防抖（v3.61 并入）：站点反复重建播放器时收尾会被反复触发（每秒刷日志）
+  let endFinishHits = [];
+  let endRecoveryAt = 0;
+  // 软恢复（退出课程重进）：比刷新便宜——刷新约一半概率落到站点启动失败页
+  let recoveryExiting = false;
+  const recoveryExitAt = [];
+  // 假用户活动（v3.61 并入）：服务端按"用户是否活跃"决定是否继续供流
+  let lastFakeMoveAt = 0;
+  let fakeMoveN = 0;
+  // 退出意图：只有脚本自己决定退出课程时，"是否继续退出"确认框才点"是"
+  let exitIntentAt = 0;
+  // click-block 遮罩看门狗（v3.61 并入）：遮罩常驻会吞掉所有点击
+  let lastUnstickAt = 0;
+  let cbSince = 0;
+  // 登录态确认（v3.61 并入）：疑似登录页要两轮确认+穿透复核，不误停不白刷
+  let loginPageHits = 0;
+  let lastPageProbeAt = 0;
+  // pause 拦截（v3.61 并入）：playing 态吞掉外部 pause()；guardOn 由 setState 维护
+  let guardOn = false;
+  const pausePulls = new WeakMap(); // 媒体被外部暂停后自动拉起的次数（日志节流）
 
   // 播放进度追踪
   let lastMediaTime = -1;
@@ -336,6 +392,8 @@
   let rateGuardBurstAt = 0;
   let rateProbeAt = 0;           // 实测推进速率探针：上次采样时间与媒体位置
   let rateProbeCur = 0;
+  let mediaErrCount = 0;         // 媒体 error 事件计数（60s 内 2 次即快速刷新恢复）
+  let mediaErrAt = 0;
 
   // ---------- 防重播护栏（多条） ----------
   // 多讲课程里播完一讲后，服务端把该讲标记为"已学"可能有延迟；
@@ -382,6 +440,7 @@
   function setState(s) {
     if (state !== s) {
       state = s;
+      guardOn = running && s === "playing"; // pause 拦截仅在运行中的播放态生效
       stateSince = now();
       lastActivity = now();
       record("INFO", "状态 → " + s); // 永久时间线：排查报告里可还原每一步耗时
@@ -413,26 +472,124 @@
   }
   function safeToReload() { return recentReloads().length < CFG.maxReloadsPer10min; }
   let lastReloadAt = 0; // doReload 防抖（实测同一秒曾连发 3 次"12分钟无进展"）
-  function doReload(reason) {
+  let reloadBusy = false;   // doReload 探网期间的重入锁（探网是异步的）
+  let offlineWait = false;  // 断网等待：自愈刷新挂起，网络恢复后执行，不烧熔断额度
+  let offlineReason = "";
+  let lastProbeAt = 0;      // 断网期间探测定节流（最多 20s 一次）
+  let haltAt = 0;           // 熔断触发时刻（自动复跑的冷却起点）
+
+  // 网络/本站可达性探测：fetch 本站 favicon（404 也算可达，仅网络层失败算断网）。
+  // 刷新前先探——断网时刷新毫无意义，还白烧熔断额度（v3.28 前断网一夜即废的根源）。
+  function netOnline() {
+    const opt = { cache: "no-store" };
+    if ("timeout" in AbortSignal) opt.signal = AbortSignal.timeout(5000);
+    return fetch(location.origin + "/favicon.ico", opt)
+      .then(() => true)
+      .catch(() => false);
+  }
+
+  // 重载风暴保护（v3.61 并入）：站点自己陷入"几秒一次重载"时，脚本再刷新只会加剧，
+  // 先冷处理（5 分钟内 >=8 次开机视为风暴）。
+  function inReloadStorm() {
+    try {
+      let a = store.get("boots", []);
+      const t = now();
+      a.push(t);
+      a = a.filter((x) => t - x < 300000);
+      store.set("boots", a);
+      return a.length >= 8;
+    } catch (e) { return false; }
+  }
+  // 缓存穿透刷新地址（v3.61 并入）：启动页反复卡死/疑似登录过期时，带一次性参数破坏缓存
+  function bustHref() {
+    const h = location.href.split("#")[0];
+    return h + (h.indexOf("?") >= 0 ? "&" : "?") + "zkbust=" + now();
+  }
+
+  async function doReload(reason, bustUrl) {
+    if (reloadBusy || offlineWait) return; // 探网中/断网等待中：合并为第一个待执行原因
     if (now() - lastReloadAt < 5000) return; // 防抖：多条看门狗可能同时到期限
-    if (!safeToReload()) {
-      running = false;
-      store.set("running", false);
-      stopAntiThrottle();
-      setState("halt");
-      setStatus("自动刷新过于频繁已熔断，请人工检查页面后重开", reason);
-      notify("⚠ 熔断：10分钟内自动刷新达上限（" + reason + "），已停机，请人工检查", "fatal");
+    if (inReloadStorm()) {
+      record("WARN", "站点处于重载风暴（5 分钟内 >=8 次开机），暂停自动刷新：" + reason);
+      setStatus("站点异常，暂停刷新等待", String(reason).slice(0, 24));
       return;
     }
-    lastReloadAt = now(); // 提交刷新：5s 内后续 doReload 一律跳过
-    const a = recentReloads();
-    a.push(now());
-    store.set("reloads", a);
-    store.set("reloadReason", reason);
-    warn("自愈刷新：" + reason + "，刷新后自动续跑");
-    notify("自愈刷新：" + reason + "，刷新后自动续跑", "warn");
-    setStatus("刷新自愈中…", reason);
-    location.reload();
+    reloadBusy = true;
+    try {
+      if (!(await netOnline())) {
+        offlineWait = true;
+        offlineReason = reason;
+        record("WARN", "网络/本站不可达（探测失败），自愈刷新挂起等待恢复（不烧熔断额度）：" + reason);
+        notify("网络中断，自愈刷新暂停；网络恢复后将自动刷新续跑", "warn");
+        return;
+      }
+      if (!safeToReload()) {
+        running = false;
+        store.set("running", false);
+        haltAt = now();
+        store.set("halted", now()); // 存熔断时刻：跨刷新/跨监督者重启保持熔断态且冷却不清零
+        stopAntiThrottle();
+        setState("halt");
+        setStatus("自动刷新过于频繁已熔断，冷却后将自动复跑（人工检查可直接停止）", reason);
+        notify("⚠ 熔断：10分钟内自动刷新达上限（" + reason + "），停机待网络冷却后自动复跑", "fatal");
+        return;
+      }
+      lastReloadAt = now(); // 提交刷新：5s 内后续 doReload 一律跳过
+      const a = recentReloads();
+      a.push(now());
+      store.set("reloads", a);
+      store.set("reloadReason", reason);
+      warn("自愈刷新：" + reason + "，刷新后自动续跑");
+      notify("自愈刷新：" + reason + "，刷新后自动续跑", "warn");
+      setStatus("刷新自愈中…", reason);
+      if (bustUrl) {
+        try { location.replace(bustUrl); return; } catch (e) {}
+      }
+      location.reload();
+    } finally { reloadBusy = false; }
+  }
+
+  // 断网期间的恢复轮询（tick 每拍调用，Worker 驱动不被后台节流）
+  async function offlineProbeTick() {
+    titleFlag = "offline"; // 心跳标题旗标：页外监督者忽略之，人扫一眼标签页即知断网
+    setStatus("网络中断，等待恢复…", "每 20s 探测；恢复后自动刷新续跑");
+    if (now() - lastProbeAt < 20000) return;
+    lastProbeAt = now();
+    if (await netOnline()) {
+      const why = offlineReason;
+      offlineWait = false;
+      record("OK", "网络已恢复，执行挂起的自愈刷新（" + why + "）");
+      doReload(why);
+    }
+  }
+
+  // 熔断自动复跑（v3.28）：熔断多半源于断网/站点暂不可达，"停机等人"会把一个
+  // 夜间网络抖动放大成整夜报废。冷却 15 分钟 + 探测可达 → 自动恢复运行；
+  // 最多 5 次（防止站点真改坏时无限循环），之后真停，由页外监督者发通知叫人。
+  // 人工点"开始刷课"即重置计数。
+  const HALT_REARM_MIN = 15;
+  const HALT_REARM_MAX = 5;
+  let rearmProbeAt = 0;
+  async function maybeRearmFromHalt() {
+    if (now() - haltAt < HALT_REARM_MIN * 60000) return;
+    const rearms = store.get("haltRearms", 0);
+    if (rearms >= HALT_REARM_MAX) return;
+    if (now() - rearmProbeAt < 30000) return; // 探测节流
+    rearmProbeAt = now();
+    if (!(await netOnline())) return;
+    store.set("haltRearms", rearms + 1);
+    store.del("halted");
+    running = true;
+    store.set("running", true);
+    startAntiThrottle();
+    startSilentAudio();
+    setState("idle");
+    record("WARN", "熔断自动复跑：冷却已过且网络可达（第 " + (rearms + 1) + "/" + HALT_REARM_MAX + " 次）");
+    notify("网络已恢复，熔断后自动复跑（第 " + (rearms + 1) + "/" + HALT_REARM_MAX + " 次）", "ok");
+    if (panelEls && panelEls.playBtn) {
+      panelEls.playBtn.classList.add("on");
+      panelEls.playBtn.textContent = "停止刷课";
+    }
   }
 
   // ---------- 样式注入 ----------
@@ -671,6 +828,9 @@
       if (running) {
         evalRetries = 0;
         recoveryTries = 0;
+        store.del("halted");   // 人工启动：清熔断态与复跑计数
+        store.del("haltRearms");
+        haltAt = 0;
         startAntiThrottle();
         startSilentAudio(); // 用户点击即手势，静音保活从这里开始生效
         installVisibilitySpoof(); // 点击时机安装，确保属性覆写成功
@@ -1102,85 +1262,319 @@
         : "Worker 心跳丢失且重建失败（后台退化为节流模式，回前台自愈）");
   }
 
+  // ---------- 假用户活动（v3.61 并入） ----------
+  // 服务端按"用户是否活跃"决定是否继续供流（实测后台挂数分钟后缓冲被掐断在授权
+  // 水位上、前挪即被回拨）。鼠标移动是播放器上报"用户在看"的主要信号。
+  function fakeUserActivity() {
+    if (now() - lastFakeMoveAt < 90000) return;
+    lastFakeMoveAt = now();
+    try {
+      const vc = $(".player-container") || $(".video-js") || document.body;
+      const r = vc.getBoundingClientRect();
+      const x = r.left + r.width * (0.3 + Math.random() * 0.4);
+      const y = r.top + r.height * (0.3 + Math.random() * 0.4);
+      const init = { bubbles: true, cancelable: true, composed: true, view: window,
+        clientX: x, clientY: y, screenX: x, screenY: y + 100, button: 0 };
+      document.dispatchEvent(new MouseEvent("mousemove", init));
+      vc.dispatchEvent(new MouseEvent("mousemove", init));
+      fakeMoveN++;
+      if (fakeMoveN % 4 === 1) record("DBG", "已注入鼠标活动信号（每 90s 一次，防服务端空闲断流）");
+    } catch (e) {}
+  }
+
+  // ---------- pause 保卫 + blur 注册吞咽（v3.61 并入） ----------
+  // 后台时播放器/站点会反复暂停视频（可见性伪装覆盖不到的路径），15s 停滞续播只是
+  // 事后补救；原型级拦截 pause() 直接事前阻止。仅 running 且 playing 态生效。
+  let nativePauseFn = null;
+  function installPauseGuard() {
+    if (nativePauseFn) return;
+    try {
+      nativePauseFn = HTMLMediaElement.prototype.pause;
+      let blocked = 0;
+      HTMLMediaElement.prototype.pause = function () {
+        if (guardOn) {
+          blocked++;
+          if (blocked <= 2 || blocked % 30 === 0) {
+            record("DBG", "拦截外部暂停 #" + blocked + "（播放器/页面在后台尝试暂停，已吞掉）");
+          }
+          return undefined;
+        }
+        return nativePauseFn.apply(this, arguments);
+      };
+    } catch (e) {
+      record("WARN", "pause 保卫安装失败：" + (e && e.message));
+    }
+  }
+
+  // 把页面后续注册的 window/document/body blur 监听改到假事件名上（比拦截事件可靠，
+  // 不受注册先后顺序影响）；元素级 blur 放行（表单逻辑依赖）。
+  function installBlurSwallow() {
+    if (!CFG.spoofFocus) return; // 未开失焦伪装时不动事件系统（手动使用站点保持原生行为）
+    try {
+      const origAdd = EventTarget.prototype.addEventListener;
+      EventTarget.prototype.addEventListener = function (type, fn, opts) {
+        if (type === "blur" && (this === window || this === document || this === document.body)) {
+          type = "zk-swallowed-blur";
+        }
+        return origAdd.call(this, type, fn, opts);
+      };
+      Object.defineProperty(window, "onblur", {
+        get: () => null, set: () => {}, configurable: true,
+      });
+      record("INFO", "blur 注册吞咽已启用（页面失焦时，其 blur 监听器不会被触发）");
+    } catch (e) {
+      record("WARN", "blur 吞咽安装失败：" + (e && e.message));
+    }
+  }
+
+  // ---------- 站点遮罩清除 + 登录态判定（v3.61 并入） ----------
+  // 站点偶发"应用已渲染、但 loading 遮罩 / click-block 残留"：遮罩会吞掉所有点击。
+  // 实测把 .click-block-enabled 去掉、隐藏 .loading-portal 后，页面立刻恢复可点。
+  function unstickLoading() {
+    if (now() - lastUnstickAt < 5000) return false;
+    let did = false;
+    try {
+      $$(".click-block").forEach((el) => {
+        const cls = String(el.className || "");
+        if (cls.indexOf("click-block-enabled") >= 0) {
+          el.className = cls.replace("click-block-enabled", "").trim();
+          did = true;
+        }
+        el.style.pointerEvents = "none";
+      });
+      $$(".loading-portal").forEach((el) => { el.style.display = "none"; did = true; });
+      $$("ion-loading").forEach((el) => { el.style.display = "none"; did = true; });
+    } catch (e) {}
+    if (did) {
+      lastUnstickAt = now();
+      record("WARN", "已清除站点 loading 遮罩/点击拦截（残留遮罩会吞掉所有点击）");
+    }
+    return did;
+  }
+
+  // 登录态判定：站点把登录信息放在 localStorage.loginInfo（data.success=true），
+  // 比页面上有没有"注册"按钮可靠（旧版 PC 首页本身就有注册按钮，曾致误判停机）。
+  function looksLikeLoginPage() {
+    try {
+      if (document.querySelector("input[type=password]")) return true;
+      if (/正在登录|请登录|登录中/.test(document.title || "")) return true;
+    } catch (e) {}
+    return false;
+  }
+  function isLoggedInByStorage() {
+    try {
+      const li = JSON.parse(localStorage.getItem("loginInfo") || "null");
+      return !!(li && li.data && li.data.success);
+    } catch (e) { return false; }
+  }
+
+  // ---------- 跳过清单与课程挂起（v3.61 并入） ----------
+  // 解码失败(error 3/4)=本机播不了的课件跳过 12 小时；打开失败暂缓 30 分钟；
+  // 评价反复失败的课程挂起 10 分钟——不与站点硬碰，先刷别的。
+  function getSkips(kind, ttlMs) {
+    const ttl = ttlMs || 12 * 3600000;
+    const o = store.get(kind, {});
+    const out = {};
+    let dirty = false;
+    for (const k of Object.keys(o)) {
+      if (now() - o[k] < ttl) out[k] = o[k];
+      else dirty = true;
+    }
+    if (dirty) store.set(kind, out);
+    return out;
+  }
+  function getOpenFails() { return getSkips("openFails", 30 * 60000); }
+  function addOpenFail(label) { addSkip("openFails", label); }
+  function addSkip(kind, label) {
+    if (!label) return;
+    const o = getSkips(kind);
+    o[label.slice(0, 24)] = now();
+    store.set(kind, o);
+    record("INFO", "记入跳过清单[" + kind + "]（12 小时）：「" + String(label).slice(0, 24) + "」");
+  }
+  // 跨刷新累计的"打开/取流失败次数"（key=课件文本前24字）
+  function bumpOpenFail(label) {
+    if (!label) return 0;
+    const key = String(label).slice(0, 24);
+    const o = store.get("ofail", {});
+    const t = now();
+    for (const k of Object.keys(o)) if (t - o[k].at > 30 * 60000) delete o[k];
+    const n = ((o[key] && o[key].n) || 0) + 1;
+    o[key] = { n, at: t };
+    store.set("ofail", o);
+    return n;
+  }
+  // 课程级挂起：到期自动重试
+  function getDefers() {
+    const o = store.get("defers", {});
+    const out = {};
+    let dirty = false;
+    for (const k of Object.keys(o)) {
+      if (o[k] > now()) out[k] = o[k];
+      else dirty = true;
+    }
+    if (dirty) store.set("defers", out);
+    return out;
+  }
+  function addDefer(label, ms) {
+    if (!label) return;
+    const o = getDefers();
+    o[String(label).slice(0, 24)] = now() + ms;
+    store.set("defers", o);
+    record("INFO", "课程挂起 " + Math.round(ms / 60000) + " 分钟（到期自动重试）：「" +
+      String(label).slice(0, 24) + "」");
+  }
+
   // ---------- 弹窗治理 ----------
   function overlays() { return $$("ion-modal"); }
 
   // 同一弹窗的关闭尝试计数（用于发现"关不掉"的弹窗）
   const overlayAttempts = new WeakMap();
+  const hardRemoveAt = [];      // 强制移除弹窗的时间戳（滚动窗口，判断是否反复出现）
+  const rewardTries = new WeakMap(); // 奖励弹窗按元素的关闭尝试计数
+  // 弹窗里是否装着播放器（站点实测会把播放器渲染成两层同名 ion-modal）
+  const modalHasMedia = (m) => !!(m && m.querySelector && m.querySelector("video,audio"));
+  // 播放器弹窗的"雏形"：弹窗先挂出来、<video> 晚一两秒才创建，这窗口期不能当残留关掉
+  const modalLooksLikePlayer = (m) => !!(m && m.querySelector &&
+    m.querySelector("modal-tc-video-player,.player-container,video,audio,.video-js,exe-video-player"));
+  // 弹窗"初次出现"的时间：刚挂出来十几秒内一律不当残留（实测 2 秒就关＝把刚开的播放器打死）
+  const overlayFirstSeen = new WeakMap();
+  function markOverlayAges() {
+    const t = now();
+    overlays().forEach((m) => { if (!overlayFirstSeen.has(m)) overlayFirstSeen.set(m, t); });
+  }
+  const overlayYoung = (m, ms) => (now() - (overlayFirstSeen.get(m) || 0)) < (ms || 15000);
 
+  // 关闭弹窗的升级阶梯（v3.61 并入重构）：①普通点击 ×2 → ②遮罩/dismiss()/Esc →
+  // ③课程页上不 Strong-remove（会破坏站点内部状态，实测后续点课件全部失效），
+  //    改为"退出课程重进"软恢复；只有非课程页（学习页奖励弹窗等）才强删 DOM。
+  // 后台（真实隐藏）单独一条快捷路径：动画不执行、导航走不动，只做无动画 dismiss
+  // 与无按钮垃圾弹窗摘除，阶梯升级等回前台。
   function dismissModal(m) {
     if (!m) return false;
-    // 播放器弹窗优先走专属路径：通用 header 按钮可能是"统计/分享"等，点了无效
-    // （实测残留的音频播放器弹窗被点了 6 次都没关，直接烧掉一次自愈刷新）
-    let clicked = false;
-    if (m.querySelector(".player-container, modal-tc-video-player, .vjs-close-button")) {
-      clicked = dismissPlayerModal(m);
+    const brief = (m.textContent || "").replace(/\s+/g, "").slice(0, 24);
+    const isPlayerModal =
+      !!m.querySelector("video, audio, .player-container, .video-js, modal-tc-video-player") ||
+      /腾讯云提供技术支持|视频统计信息/.test(m.textContent || "");
+    const back =
+      m.querySelector("ion-header .back-button") ||
+      m.querySelector("button.close, .modal-close, ion-header button");
+    const ack = $$("button", m).find((b) =>
+      /^(我知道了|知道了|确\s*定|关\s*闭|取消|×|✕)$/i.test((b.textContent || "").trim()));
+    const btn = back || ack;
+    const n = (overlayAttempts.get(m) || 0) + 1;
+    overlayAttempts.set(m, n);
+
+    if (n <= 2) {
+      // 播放器弹窗优先走专属路径（通用 header 按钮可能是"统计/分享"，点了无效）
+      if (isPlayerModal && dismissPlayerModal(m)) return true;
+      if (!btn) return false;
+      realClick(btn);
+      touch();
+      if (n === 2) record("WARN", "弹窗点击关闭未生效，下一拍升级处置：「" + brief + "」");
+      return true;
     }
-    if (!clicked) {
-      // 策略1：标题栏返回键 / 显式关闭按钮（评价弹窗等）
-      const back =
-        m.querySelector("ion-header .back-button") ||
-        m.querySelector("button.close, .modal-close, ion-header button");
-      // 策略2：无标题栏的纯按钮弹窗（奖励弹窗等），匹配确认/取消类文字按钮；
-      // 注意不匹配"翻翻背包/保存/提交"等会跳转或提交的按钮
-      const ack = $$("button", m).find((b) =>
-        /^(我知道了|知道了|确\s*定|关\s*闭|取消|×|✕)$/i.test((b.textContent || "").trim()));
-      const btn = back || ack;
-      if (btn) { realClick(btn); clicked = true; }
-    }
-    if (!clicked) {
-      // 找不到可点按钮：后台直接摘 DOM，前台返回 false 交由上层处理
-      if (pageHiddenReal() && m.isConnected) {
+
+    // 后台快捷路径：Ionic 关闭动画依赖 rAF，隐藏页里永远不完成；导航/刷新在后台
+    // SPA 里也走不动——只做无动画 dismiss；无按钮的非播放器垃圾弹窗直接摘 DOM。
+    if (pageHiddenReal()) {
+      if (!btn && !isPlayerModal && m.isConnected) {
         try {
           m.remove();
           record("WARN", "后台弹窗无按钮可点，直接移除 DOM");
           return true;
         } catch (e) {}
       }
-      return false;
-    }
-    touch();
-    const n = (overlayAttempts.get(m) || 0) + 1;
-    overlayAttempts.set(m, n);
-    if (n === 3) {
-      record("WARN", "弹窗连续 3 次点击关闭仍存在：「" +
-        (m.textContent || "").replace(/\s+/g, "").slice(0, 30) + "」");
-    }
-    // 后台点关不掉：Ionic 关闭动画依赖 rAF/过渡，隐藏标签页里永远不完成
-    //（14:05 报告实锤两起，各烧掉一次自愈刷新）。先试 dismiss(animated:false)
-    // 绕过动画，仍不行直接摘 DOM（站点内存态可能残留，但比烧刷新划算）。
-    if (pageHiddenReal() && n >= 2 && m.isConnected) {
       try { if (m.dismiss) m.dismiss(null, null, { animated: false }); } catch (e) {}
-      if (n >= 3) {
-        try {
-          m.remove();
-          record("WARN", "后台弹窗动画不执行，已直接移除 DOM：「" +
-            (m.textContent || "").replace(/\s+/g, "").slice(0, 24) + "」");
-          return true;
-        } catch (e) {}
-      }
+      return true; // 阶梯升级等回前台（n 继续累计，回前台立即进入软恢复）
     }
-    if (n >= 6) {
-      // 残留弹窗关不掉会一直空转（实测曾空转 60 秒）：自愈刷新（走熔断保护）
-      doReload("残留弹窗无法关闭（已尝试 6 次）：「" +
-        (m.textContent || "").replace(/\s+/g, "").slice(0, 24) + "」");
+
+    if (n === 3 && isPlayerModal) {
+      record("WARN", "播放器弹窗关不掉，改为退出课程重进（强删 DOM 会破坏站点内部状态）：「" + brief + "」");
+      exitCourseForRecovery("播放器弹窗无法关闭").then((ok) => {
+        if (ok) { setState("idle"); clearLock(); }
+      });
+      return true;
+    }
+    if (n === 3) {
+      try { if (btn) realClick(btn); } catch (e) {}
+      try {
+        const bd = m.parentNode ? m.parentNode.querySelector("ion-backdrop") : null;
+        if (bd) realClick(bd);
+      } catch (e) {}
+      try { if (typeof m.dismiss === "function") m.dismiss(); } catch (e) {}
+      try {
+        document.dispatchEvent(new KeyboardEvent("keydown",
+          { key: "Escape", code: "Escape", keyCode: 27, which: 27, bubbles: true }));
+      } catch (e) {}
+      touch();
+      record("WARN", "弹窗关闭升级：遮罩/dismiss()/Esc 已尝试：「" + brief + "」");
+      return true;
+    }
+    // 第 4 次起：课程页上不再强删——实测强删后站点内部状态错乱，后续点课件全部
+    // 失效。改为"退出课程重进"让站点自己正常卸载；只有不在课程页才强删。
+    if ($("course-detail-page")) {
+      record("WARN", "弹窗关不掉，改为退出课程重进（不破坏站点内部状态）：「" + brief + "」");
+      exitCourseForRecovery("弹窗无法关闭").then((ok) => {
+        if (ok) { setState("idle"); clearLock(); }
+      });
+      return true;
+    }
+    const t = now();
+    hardRemoveAt.push(t);
+    while (hardRemoveAt.length && t - hardRemoveAt[0] > 600000) hardRemoveAt.shift();
+    try { m.remove(); } catch (e) {}
+    try {
+      if (!overlays().length && !$$("ion-alert").length) {
+        $$("ion-backdrop").forEach((bd) => bd.remove());
+      }
+    } catch (e) {}
+    touch();
+    record("WARN", "弹窗无法关闭，已强制从 DOM 移除：「" + brief + "」");
+    if (hardRemoveAt.length >= 4) {
+      hardRemoveAt.length = 0;
+      doReload("弹窗反复出现且无法关闭（10 分钟内强制移除 4 次）：「" + brief + "」");
     }
     return true;
   }
 
-  // "获得奖励"弹窗：通过课程后弹出，无标题栏返回键，只有"我知道了/翻翻背包"
+  // "获得奖励"弹窗：通过课程后弹出，无标题栏返回键，只有"我知道了/翻翻背包"。
+  // 两个坑（v3.61 实录）：①关闭动画期间同一弹窗持续匹配→日志每秒一条，按元素计数
+  // 只记一次；②合成点击偶尔点不掉它→按冷却重试，3 次改点按钮内层元素，5 次强删
+  // （纯信息弹窗，奖励已由服务端入账）。绝不能"标记已处理就永久 return true"——
+  // 那会把 tick 提前截断，连无进展看门狗都跑不到（实测卡了整整一小时）。
   function closeReward() {
     const m = $$("ion-modal, .exe-win-open-modal")
       .find((el) => /获得奖励|恭喜您/.test(el.textContent || ""));
     if (!m) return false;
     const btn = $$("button", m).find((b) => /我知道了|知道了/.test((b.textContent || "").trim()));
-    if (btn) {
-      realClick(btn);
-      touch();
-      notify("🎉 课程通过，已自动关闭奖励弹窗", "ok");
-      return true;
+    if (!btn) return false;
+    const st = rewardTries.get(m) || { n: 0, at: 0 };
+    if (now() - st.at < 1200) return true; // 冷却窗口内不重复点（关闭动画约 1 秒）
+    st.n++;
+    st.at = now();
+    rewardTries.set(m, st);
+    if (st.n === 1) notify("🎉 课程通过，已自动关闭奖励弹窗", "ok");
+    realClick(btn);
+    touch();
+    if (st.n >= 3) {
+      // 连点没关：把事件打到按钮内层元素（站点常把点击目标放在 span/i 上）
+      const inner = btn.firstElementChild || btn;
+      const opt = { bubbles: true, cancelable: true, composed: true };
+      try {
+        inner.dispatchEvent(new PointerEvent("pointerdown", opt));
+        inner.dispatchEvent(new MouseEvent("mousedown", opt));
+        inner.dispatchEvent(new PointerEvent("pointerup", opt));
+        inner.dispatchEvent(new MouseEvent("mouseup", opt));
+        inner.dispatchEvent(new MouseEvent("click", opt));
+      } catch (e) {}
     }
-    return false;
+    if (st.n >= 5) {
+      record("WARN", "奖励弹窗点了 " + st.n + " 次仍未关闭，已强制从 DOM 移除");
+      try { m.remove(); } catch (e) {}
+      return false;
+    }
+    return true;
   }
 
   // 播放期间也要治理"外来"弹窗（奖励/系统确认框/残留弹窗），
@@ -1188,8 +1582,13 @@
   function handleForeignOverlays(media) {
     if (handleAlerts()) return true;
     if (closeReward()) return true;
+    const mods = overlays();
+    // 播放器在场（含"弹窗刚挂出、video 还没创建"的雏形阶段）时一律不碰任何弹窗：
+    // 把它们当"外来残留"去关，会走 关不掉→升级→退出课程重进 的死循环。
+    if (mods.some(modalHasMedia) || mods.some(modalLooksLikePlayer)) return false;
     const home = media ? media.closest("ion-modal") : null;
-    const foreign = overlays().filter((m) => m !== home);
+    // 刚出现的弹窗给 12 秒年龄保护，避免把站点自己的进场弹窗误判成残留
+    const foreign = mods.filter((m) => m !== home && !overlayYoung(m, 12000));
     let acted = false;
     for (const m of foreign) if (dismissModal(m)) acted = true;
     return acted;
@@ -1215,13 +1614,27 @@
       rec.at = now();
       alertStrikes.set(sig, rec);
 
-      if (rec.n >= 6) {
-        record("WARN", "确认框反复出现且关不掉（已点 " + rec.n + " 次）：「" + body + "」，自愈刷新");
-        doReload("确认框反复出现无法关闭：" + body.slice(0, 24));
+      const strikeCap = /继续退出/.test(body) ? 10 : 6; // 退出确认框：多点几轮，等浏览器层真实点击介入
+      if (rec.n >= strikeCap) {
+        record("WARN", "确认框反复出现且关不掉（已点 " + rec.n + " 次）：「" + body + "」，带缓存穿透自愈刷新");
+        doReload("确认框反复出现无法关闭：" + body.slice(0, 24), bustHref());
         return true;
       }
       let pick;
-      if (rec.n >= 3) {
+      if (/是否继续退出|继续退出/.test(body)) {
+        // 退出确认框（v3.61 实录）：播放器弹窗还开着时点"是"不生效（连点 5 次无效），
+        // 先关播放器再点；连点仍无效 → 退出课程重进软恢复（比重载便宜，不碰熔断额度）。
+        if (rec.n >= 2) {
+          if (dismissPlayerModal()) record("DBG", "确认框点不动：先关闭播放器弹窗再重试");
+        }
+        if (rec.n >= 3) {
+          record("WARN", "退出确认框点不动，改为退出课程重进");
+          exitCourseForRecovery("退出确认框无法关闭");
+          return true;
+        }
+        pick = btns.find((b) => /^(是|确\s*定|确\s*认)$/.test((b.textContent || "").trim())) ||
+          btns[btns.length - 1];
+      } else if (rec.n >= 3) {
         pick = btns[0]; // 第 3 次起换一个按钮（通常是"否/取消"）
       } else if (CFG.alertPolicy === "cancel") {
         pick = btns.find((b) => /取消|关闭|否/.test(b.textContent || "")) || btns[0];
@@ -1236,16 +1649,25 @@
     return true;
   }
 
-  // 堆叠弹窗回收：我们的流程任何时刻至多一个弹窗；>1 即为历史残留
+  // 堆叠弹窗回收：我们的流程任何时刻至多一个弹窗；>1 即为历史残留。
+  // 播放器双层弹窗保护（v3.61 实录）：站点会把播放器渲染成两层同名 ion-modal，
+  // 按"多出来的都是残留"清理会把正在播的那层删掉；只要有播放器在场，弹窗一个
+  // 都不动，收尾交给 onMediaEnded/dismissPlayerModal。
   function modalGarbageCollect() {
     const mods = overlays();
+    markOverlayAges();
+    if (mods.some(modalHasMedia)) return false;
     if (mods.length > 1) {
-      warn("检测到 " + mods.length + " 个堆叠弹窗，清理 " + (mods.length - 1) + " 个");
-      mods.slice(0, -1).forEach(dismissModal);
-      lock(3000, () => overlays().length === 0, "等弹窗关闭动画");
+      // 只清理"不像播放器"的多余弹窗（播放器雏形期也受保护）
+      const junk = mods.filter((m) => !modalLooksLikePlayer(m));
+      if (!junk.length) return false;
+      warn("检测到 " + mods.length + " 个堆叠弹窗，清理其中无播放器的 " + junk.length + " 个");
+      junk.forEach(dismissModal);
+      lock(3000, () => overlays().filter((m) => !modalLooksLikePlayer(m)).length === 0, "等弹窗关闭动画");
       return true;
     }
-    if (mods.length === 1 && inState("idle", "entering") && !playingMedia()) {
+    if (mods.length === 1 && inState("idle", "entering") && !playingMedia() &&
+        !modalLooksLikePlayer(mods[0]) && !overlayYoung(mods[0])) {
       if (dismissModal(mods[0])) {
         warn("关闭空闲期残留弹窗");
         lock(3000, () => overlays().length === 0, "等弹窗关闭动画");
@@ -1334,6 +1756,55 @@
     if (back) { realClick(back); touch(); record("DBG", "点击返回（离开课程页）"); return true; }
     record("DBG", "未找到课程页返回按钮");
     return false;
+  }
+
+  // 退出课程重进（v3.61 并入）：站点内部状态错乱（播放器弹窗卡死、课件点了全没
+  // 反应、视频流卡死）时的"软恢复"。比刷新页面便宜得多——实测刷新约有一半概率
+  // 落进站点启动失败页（只剩"注册"入口）。5 分钟内 4 次仍异常才升级为刷新。
+  function markExitIntent() { exitIntentAt = now(); }
+  async function exitCourseForRecovery(reason) {
+    if (recoveryExiting) return false;
+    if (!$("course-detail-page")) return true;
+    const t0 = now();
+    recoveryExitAt.push(t0);
+    while (recoveryExitAt.length && t0 - recoveryExitAt[0] > 300000) recoveryExitAt.shift();
+    if (recoveryExitAt.length >= 4) {
+      recoveryExitAt.length = 0;
+      doReload("站点状态反复异常（5 分钟内退出重进 4 次）：" + reason);
+      return false;
+    }
+    recoveryExiting = true;
+    record("WARN", "退出课程重进（站点状态恢复）：" + reason);
+    lock(12000, () => !$("course-detail-page"), "退出课程恢复中");
+    markExitIntent(); // 这次是真的要退出，确认框要点"是"
+    const answerExitYes = () => {
+      try {
+        for (const a of $$("ion-alert")) {
+          const btns = $$(".alert-button", a);
+          if (!btns.length) continue;
+          const yes = btns.find((b) => /^(是|确\s*定|确\s*认)$/.test((b.textContent || "").trim())) ||
+            btns[btns.length - 1];
+          realClick(yes);
+        }
+      } catch (e) {}
+    };
+    try {
+      goBackFromCourse();
+      let ok = await waitFor(() => { answerExitYes(); return !$("course-detail-page"); }, 6000, 250);
+      if (!ok) {
+        const back = $(".show-back-button");
+        if (back) realClick(back);
+        ok = await waitFor(() => { answerExitYes(); return !$("course-detail-page"); }, 4000, 250);
+      }
+      if (ok) record("INFO", "已退出课程，下一拍重新进入继续刷");
+      else record("WARN", "退出课程未确认（课程页仍在），交给后续处置");
+      return ok;
+    } catch (e) {
+      record("WARN", "退出课程异常: " + (e && e.message));
+      return false;
+    } finally {
+      recoveryExiting = false;
+    }
   }
 
   // 媒体自然播完（事件驱动，后台标签页也能及时触发）
@@ -1510,6 +1981,37 @@
     audibleOn = false; audibleTriedAt = 0; audibleFailed = false;
   }
 
+  // 解码失败兜底（v3.61 并入）：error code 3（解码失败）/ 4（格式不支持）= 本机播不了
+  // （实测部分视频在本机 Edge/Chrome 均报 code 3，换设备正常）。跳过该课件续刷
+  // 下一个；某课程只剩这类课件时连课程卡一起跳过（handleLearnPage 的 courseSkips）。
+  function bailUnplayableMedia(media, code) {
+    if (finishedMedia.has(media)) return;
+    finishedMedia.add(media);
+    record("WARN", "视频解码失败（error code=" + code + "）：本机无法播放该课件，跳过续刷下一个");
+    // 只按"本次点击打开的课件"记账：站点自动接续播放时 currentMediaLabel 还是
+    // 上一节的，会把刚播完的视频误记成解码失败（v3.61 日志实录）。
+    if (currentMediaLabel && lastOpenClickAt && now() - lastOpenClickAt < 30000) {
+      markDone(currentMediaLabel); // 防重播护栏同步生效，避免收尾间隙被重点
+      addSkip("skips", currentMediaLabel);
+    } else {
+      record("DBG", "该播放器非本拍点击打开（疑似站点自动接续），不记跳过清单：「" +
+        (currentMediaLabel || "未知课件") + "」");
+    }
+    setState("closing");
+    lock(25000, null, "解码失败跳过收尾");
+    (async () => {
+      try {
+        dismissPlayerModal();
+        if (!(await waitFor(() => !$("modal-tc-video-player"), 2500))) {
+          dismissPlayerModal();
+          await waitFor(() => !$("modal-tc-video-player"), 1500);
+        }
+      } catch (e) { warn("跳过收尾异常: " + e.message); }
+      if (inState("closing")) setState("idle");
+      clearLock();
+    })();
+  }
+
   function manageMedia(media) {
     if (finishedMedia.has(media)) return; // 已收尾的残留媒体，等待 DOM 移除即可
     if (CFG.muted && !audibleOn) media.muted = true; // 保活期间不回压静音
@@ -1522,11 +2024,89 @@
       rateResetForMedia(); // 新课件：倍速降档/上限状态重新开始
       stallMediaReset();   // 新课件：停滞计时与挂起自救状态重新开始
       lastMediaTime = -1;
+      lastTickPos = -1;
       lastMediaProgressAt = now();
       lastProgressLogAt = now();
       openTries = 0; // 播放器已出现，重置"打不开"计数
+      reenterTried = false; // 播放器已出现，重置"退出重进"软恢复标记
       rateProbeAt = 0; rateProbeCur = 0; // 实测速率探针随新课件重置
+      mediaErrCount = 0; // 媒体错误计数随新课件重置
+      noDataSince = 0; noDataBufEnd = -1; freezeStrikes = 0; lastStallPos = -1;
       media.addEventListener("ended", () => onMediaEnded(media));
+      // pause 事件快速拉起（v3.61 并入）：若播放器缓存了原生 pause 引用绕过原型
+      // 拦截，在此 0.5s 内感知并重新播放，不必等 15s 停滞检测。
+      media.addEventListener("pause", () => {
+        if (!guardOn || finishedMedia.has(media)) return;
+        setTimeout(() => {
+          try {
+            if (guardOn && media.paused && !finishedMedia.has(media)) {
+              const n = (pausePulls.get(media) || 0) + 1;
+              pausePulls.set(media, n);
+              if (n <= 2 || n % 20 === 0) {
+                record("WARN", "媒体被外部暂停，已自动拉起（第 " + n + " 次）");
+              }
+              const p = media.play();
+              if (p && p.catch) p.catch(() => {});
+            }
+          } catch (e) {}
+        }, 500);
+      });
+      // 媒体事件观测（v3.61 并入）：waiting=缺数据等待，stalled=取流停滞——
+      // 排查"卡住"时第一手证据。计数节流，防止刷屏。
+      let meEvtN = 0;
+      for (const evTy of ["waiting", "stalled", "abort"]) {
+        media.addEventListener(evTy, () => {
+          meEvtN++;
+          if (meEvtN <= 4 || meEvtN % 20 === 0) {
+            record("DBG", "媒体事件 " + evTy + " #" + meEvtN + "：waiting=缺数据等待，stalled=取流停滞");
+          }
+        });
+      }
+      // 等待数据快速前挪（v3.61 并入）：15s 停滞判定太慢——"缺数据"型停滞每次
+      // 都白等 15s。收到 waiting 后 4s 无进展就戳一下，把单次损失压到 4s 级。
+      let fastNudgeN = 0;
+      let lastFastNudgeAt = 0;
+      media.addEventListener("waiting", () => {
+        if (!guardOn || finishedMedia.has(media)) return;
+        const curAtEvent = media.currentTime || 0;
+        setTimeout(() => {
+          try {
+            if (!guardOn || finishedMedia.has(media) || media.paused) return;
+            if ((media.currentTime || 0) > curAtEvent + 0.05) return;
+            if (now() - lastFastNudgeAt < 5000) return;
+            lastFastNudgeAt = now();
+            fastNudgeN++;
+            media.currentTime = curAtEvent + 0.1;
+            if (fastNudgeN <= 3 || fastNudgeN % 10 === 0) {
+              record("DBG", "数据等待 4s 无进展，提前前挪 0.1s（第 " + fastNudgeN +
+                " 次，不等 15s 停滞判定）");
+            }
+          } catch (e) {}
+        }, 4000);
+      });
+      // 接管时已带解码/格式错误：直接走跳过
+      if (media.error && (media.error.code === 3 || media.error.code === 4)) {
+        bailUnplayableMedia(media, media.error.code);
+        return;
+      }
+      // 媒体硬错误（v3.28 快速通道 + v3.61 跳过清单合并）：
+      // code 3/4 = 本机解码不了 → 跳过课件 12h（刷新无解，换设备才能播）；
+      // 其余（1=中止 2=网络）60s 内 2 次 → 快速刷新恢复（走断网探测与熔断保护）。
+      media.addEventListener("error", () => {
+        const c = media.error ? media.error.code : 0;
+        if (c === 3 || c === 4) {
+          if (!inState("playing") || finishedMedia.has(media)) return;
+          bailUnplayableMedia(media, c);
+          return;
+        }
+        record("WARN", "媒体错误事件 code=" + c + "（1=中止 2=网络）" +
+          (media.error && media.error.message ? "：" + String(media.error.message).slice(0, 60) : ""));
+        if (now() - mediaErrAt > 60000) mediaErrCount = 0; // 只累计 60s 内的连续错误
+        mediaErrAt = now();
+        if (++mediaErrCount >= 2 && inState("playing")) {
+          doReload("媒体连续错误（code=" + c + "），快速恢复");
+        }
+      });
       // 倍速保卫（v3.26）：站点播放器会监听 ratechange 把倍速重置回自己的状态
       // （实测：脚本每拍设 16x、站点间隙打回 1x，净效果 1x——60 分钟的课播了
       // 59 分钟，日志采样恰在设置后显示 ×16 完全无察觉）。此处即时夺回；
@@ -1555,6 +2135,21 @@
     const cur0 = media.currentTime || 0;
     const dur0 = media.duration;
     if (isFinite(dur0) && dur0 > 0 && cur0 >= dur0 - 1.5) {
+      // 播完收尾防抖（v3.61 并入）：收尾流程（关播放器/评价/补报）卡住时这里
+      // 会反复触发"已播完"。3 次后退出课程重进、15s 内 5 次直接刷新。
+      const t = now();
+      endFinishHits = endFinishHits.filter((x) => t - x < 15000);
+      endFinishHits.push(t);
+      if (endFinishHits.length >= 5) {
+        doReload("播完收尾反复触发无法推进");
+        return;
+      }
+      if (endFinishHits.length === 3 && t - endRecoveryAt > 60000) {
+        endRecoveryAt = t;
+        record("WARN", "播完收尾第 3 次触发仍无进展，退出课程重进");
+        exitCourseForRecovery("播完收尾卡住");
+        return;
+      }
       record("INFO", "检测到媒体已播完（" + fmtClock(cur0) + "/" + fmtClock(dur0) + "），直接收尾");
       onMediaEnded(media);
       return;
@@ -1576,6 +2171,17 @@
 
     // 进度追踪（正常推进则不断续命看门狗）
     const cur = media.currentTime || 0;
+    // 回拨检测（v3.61 并入）：位置意外大幅回退 = 站点重开了课件或解码器异常，
+    // 记录供排查（防重播护栏会把真重播挡在点击层，这里到不了）。
+    if (lastTickPos > 0 && cur < lastTickPos - 1) {
+      record("WARN", "播放位置回拨：" + fmtClock(lastTickPos) + " → " + fmtClock(cur) +
+        "（疑似站点重开课件或解码器异常）");
+      noDataSince = 0; noDataBufEnd = -1; freezeStrikes = 0;
+    }
+    lastTickPos = cur;
+    // 伪造用户活动（v3.61 并入）：部分站点对"长时间无鼠标活动"的会话降级或弹
+    // 挽留框，周期性派发一次合成 mousemove（90s 节流）。
+    fakeUserActivity();
     if (cur > lastMediaTime + 0.5) {
       lastMediaTime = cur;
       lastMediaProgressAt = now();
@@ -1598,7 +2204,7 @@
     if (stallSince) setStatus("进度停滞中", "已 " + Math.round((now() - stallSince) / 1000) +
       "s（自动恢复中，反复无效将刷新重开）");
 
-    // 细粒度停滞处理：续播 + 挂起识别 + 可听化自救 + 降档（日志聚合，不刷屏）
+    // 细粒度停滞处理：续播 + 挂起识别 + 可听化自救 + 降档 + 缺数据分层（v3.61 并入）
     if (!media.paused && progressedMedia.has(media) &&
         now() - lastMediaProgressAt > CFG.stallResumeSec * 1000) {
       const ahead = bufferedAhead(media);
@@ -1613,6 +2219,65 @@
           (ahead >= 0 ? " 缓冲前瞻=" + ahead.toFixed(1) + "s" : "") +
           (ahead === 0 ? "（缓冲已耗尽：供流跟不上倍速）" :
             suspended ? "（疑似浏览器冻结后台视频时钟）" : ""));
+      }
+      // ---- 分层处置（v3.61 并入）：数据充足冻结 / 缺数据 / 浏览器挂起，恢复手段不同 ----
+      let bufEnd = -1, bufStart = -1;
+      try {
+        const b = media.buffered;
+        if (b && b.length) { bufEnd = b.end(b.length - 1); bufStart = b.start(b.length - 1); }
+      } catch (e) {}
+      if (!suspended && media.readyState >= 3) {
+        // 数据充足却冻结：①前挪 0.1s 戳醒解码器 ②跳进有效数据区（最多跳 1s）③刷新。
+        // 挂起签名（suspended）不走进本阶梯——那是浏览器冻结，交给可听化自救+看门狗。
+        freezeStrikes = (cur - lastStallPos > 1) ? 1 : freezeStrikes + 1;
+        lastStallPos = cur;
+        if (freezeStrikes === 1) {
+          try { media.currentTime = cur + 0.1; } catch (e) {}
+          record("DBG", "数据充足但冻结（第 1 招）：前挪 0.1s 戳醒解码器");
+        } else if (freezeStrikes === 2) {
+          let target = cur + 1;
+          if (bufStart > cur + 0.5) target = bufStart + 0.05;
+          try { media.currentTime = target; } catch (e) {}
+          record("DBG", "数据充足仍冻结（第 2 招）：跳到 " + fmtClock(target) +
+            "（若播放头卡在缓冲死区，跳进有效数据区，最多跳过 1 秒内容）");
+        } else {
+          record("WARN", "冻结 2 招无效且无净进展（疑似服务端位置锁定或深度冻结），自愈刷新");
+          doReload("播放冻结且恢复手段无效（readyState=" + media.readyState + "）");
+          return;
+        }
+      } else if (!suspended) {
+        // 缺数据：前挪触发取数。缓冲末端 90 秒不增长 = 站点/CDN 不再下发分片，
+        // play()/前挪都救不回来 → 退出课程重进（重新请求分片）；同课件 3 次 →
+        // 跳过 12 小时先刷别的（实测"一小时只推进 38 秒"即此症）。
+        try { media.currentTime = cur + 0.1; } catch (e) {}
+        record("DBG", "缺数据停滞：前挪 0.1s 触发取数（缓冲=[" +
+          (bufStart < 0 ? "?" : fmtClock(bufStart)) + "~" + (bufEnd < 0 ? "无" : fmtClock(bufEnd)) +
+          "]/" + fmtClock(media.duration) + " networkState=" + media.networkState + "）");
+        lastStallPos = cur;
+        freezeStrikes = 0;
+        if (bufEnd > noDataBufEnd + 0.5) {
+          noDataBufEnd = bufEnd;
+          noDataSince = now();
+        } else if (!noDataSince) {
+          noDataSince = now();
+        }
+        if (now() - noDataSince > 90000) {
+          noDataSince = 0;
+          noDataBufEnd = -1;
+          const label = currentMediaLabel || "";
+          const nFail = label ? bumpOpenFail(label) : 0;
+          record("WARN", "视频流 90 秒无新数据（缓冲停在 " + fmtClock(bufEnd) + "/" +
+            fmtClock(media.duration) + "，播放头 " + fmtClock(cur) + "），重开课件" +
+            (label ? "（该课件第 " + nFail + " 次）" : ""));
+          if (nFail >= 3 && label) {
+            addOpenFail(label);
+            addSkip("skips", label);
+            record("WARN", "该课件 " + nFail + " 次取流失败，跳过 12 小时先刷别的");
+          }
+          stallMediaReset();
+          exitCourseForRecovery("视频流卡死（缓冲不再增长）");
+          return;
+        }
       }
       const p = media.play();
       if (p && p.catch) p.catch(() => {});
@@ -1707,6 +2372,13 @@
     clearLock();
   }
 
+  // 站点 toast 文本（v3.61 并入）：保存失败时站点只弹 ion-toast 不改任何状态，
+  // 读取它才能区分"没提交上"和"提交了没确认"。
+  const toastText = () => {
+    const t = $("ion-toast") || $(".toast-md") || $(".toast-ios");
+    return t ? normText(t.textContent || "") : "";
+  };
+
   async function runEvaluate(evalItem) {
     if (!evalItem) { setState("idle"); clearLock(); return; }
     setState("evaluating");
@@ -1766,7 +2438,12 @@
         await workerSleep(1000);
         setState("idle");
         clearLock();
-        if (evalRetries >= 3) { evalRetries = 0; doReload("评价弹窗缺少星级控件"); }
+        if (evalRetries >= 3) {
+          evalRetries = 0;
+          record("WARN", "评价弹窗反复缺少星级控件，本课程缓办 10 分钟，先刷别的");
+          addDefer(currentCourseLabel, 600000);
+          exitCourseForRecovery("评价弹窗缺少星级控件");
+        }
         return;
       }
       {
@@ -1812,7 +2489,12 @@
         await workerSleep(1000);
         setState("idle");
         clearLock();
-        if (evalRetries >= 3) { evalRetries = 0; doReload("星级反复无法选中"); }
+        if (evalRetries >= 3) {
+          evalRetries = 0;
+          record("WARN", "星级反复无法选中，本课程缓办 10 分钟，先刷别的");
+          addDefer(currentCourseLabel, 600000);
+          exitCourseForRecovery("评价星级无法选中");
+        }
         return;
       }
       const save = me.querySelector("ion-footer button");
@@ -1821,11 +2503,13 @@
       if (save) realClick(save);
 
       // ---- 结果判定：等待期间实时处理确认框/奖励弹窗（保存后站点常先弹确认框，
-      //      干等 8 秒会误判失败、反复重评） ----
+      //      干等 8 秒会误判失败、反复重评）；顺手捕获 toast 文本 ----
+      let evalToast = "";
       await waitFor(() => {
         const its = $$(".course-item");
         const lst = its[its.length - 1];
         if (lst && /已评定/.test(lst.innerText || "")) return true;
+        if (!evalToast) evalToast = toastText();
         if ($$("ion-alert").length) handleAlerts();
         closeReward();
         return !isOpen(pickOverlay("modal-evaluate"));
@@ -1837,6 +2521,7 @@
       const modalClosed = !isOpen(pickOverlay("modal-evaluate"));
       if (lastDone || modalClosed) {
         setState("backing");
+        markExitIntent();
         const back = $(".show-back-button");
         if (back) realClick(back);
         markEvalDone(currentCourseLabel); // 评价防重：30 分钟内不再对本课程提交评价
@@ -1846,15 +2531,32 @@
         await waitFor(() => !$("course-detail-page"), 3000);
         evalRetries = 0;
       } else {
+        // 站点明说"先学完再评"：评价流程没毛病，是课件未完成——立即放弃并缓办，
+        // 别烧重试（v3.61 实录：未完成评价反复重试 3 次烧成刷新）。
+        const tt = evalToast || toastText();
+        if (/请先|未完成|学完|学习完成/.test(tt)) {
+          record("WARN", "站点提示暂不能评价：「" + tt.slice(0, 40) + "」，本课程缓办 10 分钟，先刷别的");
+          evalRetries = 0;
+          const m = pickOverlay("modal-evaluate");
+          if (m) dismissModal(m);
+          addDefer(currentCourseLabel, 600000);
+          exitCourseForRecovery("站点提示课件未完成暂不能评价");
+          return;
+        }
         evalRetries++;
         warn("评价未确认完成，第 " + evalRetries + " 次重试" + (starOk ? "" : "（星级可能未选中）"));
+        record("DBG", "评价失败现场：toast=「" + tt.slice(0, 40) + "」 星级容器类=" +
+          (group ? group.className : "无") + " 保存按钮=" +
+          ($("ion-footer button") ? "在" : "无"));
         const m = pickOverlay("modal-evaluate") || pickOverlay("ion-modal");
         if (m) dismissModal(m);
         await workerSleep(1000);
         if (evalRetries >= 3) {
           evalRetries = 0;
-          doReload("评价流程反复失败");
-          return; // 页面即将刷新或已熔断，无需复位状态
+          record("WARN", "评价反复失败，本课程缓办 10 分钟，先刷别的");
+          addDefer(currentCourseLabel, 600000);
+          exitCourseForRecovery("评价流程反复失败");
+          return; // 流程已交棒软恢复，无需复位状态
         }
       }
     } catch (e) { warn("评价流程异常: " + e.message); }
@@ -1879,13 +2581,27 @@
       !el.classList.contains("exam2_top") &&
       !el.getAttribute("exepower");
     const pending = items.filter(isPending);
+    // 空列表持续确权（v3.61 并入）：列表重渲染瞬间会短暂"全部已学"，6s 持续为空
+    // 才允许做完成判定（配合进入稳定期双保险）。
+    if (pending.length) pendingZeroSince = 0;
+    else if (!pendingZeroSince) pendingZeroSince = now();
 
     // 防重播护栏（多条，5 分钟有效）：刚播完的课件若尚未被服务端标记"已学"，不再点它
     // 用前 24 字前缀匹配，容忍站点在条目文字上追加"进度:xx%"等角标
     const candidates = pending.filter((el) => !isDoneMarked(normText(el.innerText).slice(0, 24)));
 
+    // 跳过清单过滤（v3.61 并入）：解码失败(12h)/打开失败(30min)的课件不再选，
+    // 防止反复撞同一堵墙；可处理项全被跳过时连课程一起跳过（见下）。
+    const skipsList = getSkips("skips");
+    const openFailsList = getOpenFails();
+    const skippedItem = (el) => {
+      const lbl = normText(el.innerText).slice(0, 24);
+      return !!(skipsList[lbl] || openFailsList[lbl]);
+    };
+    const playable = candidates.filter((el) => !skippedItem(el));
+
     // 跳过无法识别类型的课件（如图文），继续找下一个可处理的，避免堵死列表
-    const target = candidates.find((el) => /文档课件|音频|视频/.test(el.innerText || ""));
+    const target = playable.find((el) => /文档课件|音频|视频/.test(el.innerText || ""));
 
     if (target) {
       const text = normText(target.innerText);
@@ -1895,7 +2611,8 @@
       lastOpenClickAt = now();
       currentMediaLabel = text;
       record("DBG", "选中课件[" + (text.includes("文档课件") ? "文档" : text.includes("音频") ? "音频" : "视频") +
-        "]：" + text.slice(0, 30) + "（待学 " + pending.length + " / 可处理 " + candidates.length + "）");
+        "]：" + text.slice(0, 30) + "（待学 " + pending.length + " / 可处理 " + playable.length +
+        (playable.length < candidates.length ? "，跳过 " + (candidates.length - playable.length) : "") + "）");
       lock(15000, () => !!playingMedia(), "等待播放器出现");
       target.click(); // modal 弹出动画期间有锁，tick 不会重复点击
       // 快速接管探针：播放器一出现就立刻接管挂监听（不等下一次轮询）
@@ -1924,7 +2641,9 @@
         if (topupIdleLabel !== lbl) { topupIdleLabel = lbl; topupIdleCount = 0; }
         if (++topupIdleCount > 3) {
           topupIdleCount = 0;
-          doReload("完成状态反复无法确认（补报 3 次仍未标记，刷新强制同步）");
+          // 退出重进让课程页全量重取（比刷新便宜，且刷新有一半概率落到站点启动失败页）
+          record("WARN", "完成状态反复无法确认，退出课程重进强制同步");
+          exitCourseForRecovery("完成状态反复无法确认");
           return;
         }
         record("WARN", "重开课件补报进度（第 " + topupIdleCount + " 次）：" + lbl);
@@ -1934,6 +2653,18 @@
       return;
     }
     waitLearnedSince = 0;
+    if (!playable.length && candidates.length) {
+      // 可处理课件全部在跳过清单（v3.61 并入）：解码失败/打不开的课件堵死了整门课，
+      // 跳过本课程 12 小时先刷别的，到期自动回来重试。
+      record("WARN", "本课程可处理课件全部在跳过清单中（" + candidates.length +
+        " 项），跳过课程 12 小时先刷别的");
+      markExitIntent();
+      addSkip("courseSkips", currentCourseLabel);
+      const back = $(".show-back-button");
+      if (back) realClick(back); else goBackFromCourse();
+      await waitFor(() => !$("course-detail-page"), 3000);
+      return;
+    }
     if (candidates.length) {
       const first = candidates[0];
       noteOnce("unknown-" + normText(first.innerText).slice(0, 24),
@@ -1948,6 +2679,12 @@
       setStatus("课程页加载中", "确认课件列表状态…");
       return;
     }
+    // 空列表持续确权（v3.61 并入）：连续 6s 观察到空才认"全部完成"，
+    // 播完收尾间隙的列表重渲染不再触发过早评价。
+    if (!pending.length && pendingZeroSince && now() - pendingZeroSince < 6000) {
+      setStatus("课件列表确认中", "持续为空 " + Math.round((now() - pendingZeroSince) / 1000) + "s/6s");
+      return;
+    }
 
     // 全部课件已学：先看是否已评定（避免重复提交评价），再决定评价或返回
     const lastItem = items[items.length - 1];
@@ -1958,6 +2695,7 @@
     }
     if (lastItem && /已评定/.test(lastItem.innerText || "")) {
       record("INFO", "课程已完成（已评定），返回学习页");
+      markExitIntent();
       const back = $(".show-back-button");
       if (back) realClick(back);
       await waitFor(() => !$("course-detail-page"), 3000);
@@ -1967,6 +2705,7 @@
       (lastItem.classList.contains("exam2_top") || /评价/.test(lastItem.innerText || "")));
     if (!isEvalItem) {
       record("INFO", "课件已全部完成且无需评价，返回学习页");
+      markExitIntent();
       const back = $(".show-back-button");
       if (back) realClick(back);
       else goBackFromCourse();
@@ -1976,6 +2715,7 @@
     if (isEvalMarked(currentCourseLabel)) {
       // 评价防重护栏：30 分钟内已评价过本课程，直接返回学习页（避免重复提交）
       record("INFO", "本课程 30 分钟内已评价过（防重护栏），跳过评价返回学习页");
+      markExitIntent();
       const back = $(".show-back-button");
       if (back) realClick(back); else goBackFromCourse();
       await waitFor(() => !$("course-detail-page"), 3000);
@@ -1995,11 +2735,22 @@
       $$("page-learn ion-list").find((l) => l.querySelector("exe-learn-card"));
     const cards = list ? $$("exe-learn-card", list) : [];
     if (cards.length) {
+      // 课程卡过滤（v3.61 并入）：跳过清单/挂起中的课程先不进，拿下一门——
+      // 避免一门解码失败的课把整晚堵死（到期自动回来重试）。
+      const courseSkips = getSkips("courseSkips");
+      const defers = getDefers();
+      const cardLabel = (c) => normText(c.innerText).slice(0, 24);
+      const usable = cards.filter((c) => !courseSkips[cardLabel(c)] && !defers[cardLabel(c)]);
+      if (!usable.length) {
+        noteOnce("all-courses-skipped", "在学课程全部在跳过/挂起清单中，等待到期自动重试");
+        setStatus("课程暂不可进", "全部在跳过/挂起清单（到期自动重试）");
+        return;
+      }
       setState("entering");
       enterTries++;
-      currentCourseLabel = normText(cards[0].innerText).slice(0, 24); // 评价防重护栏的键
+      currentCourseLabel = cardLabel(usable[0]); // 评价防重护栏的键
       record("DBG", "点击学习卡片（第 " + enterTries + " 次尝试）：进入课程：" +
-        normText(cards[0].innerText).slice(0, 24));
+        cardLabel(usable[0]) + (usable.length < cards.length ? "（跳过 " + (cards.length - usable.length) + " 门）" : ""));
       if (enterTries >= 4) {
         enterTries = 0;
         doReload("点击学习卡片后课程页始终未出现（已尝试 4 次）");
@@ -2010,7 +2761,7 @@
         const p = $("course-detail-page");
         return !!p && !!p.querySelector(".course-item");
       }, "等待课程页加载");
-      cards[0].click();
+      usable[0].click();
     } else {
       noteOnce("no-cards", "学习页没有可进入的在学课程");
       setStatus("没有在学课程", "学习页待命");
@@ -2019,17 +2770,30 @@
 
   // 不在学习页/课程页时，自动点击底部"学习"标签导航过去
   function gotoLearnTab() {
-    // 优先在底部标签栏/侧边菜单范围内找"学习"入口
-    const scoped = $$("ion-tabbar button, .tabbar button, ion-tabs button, exe-menus button")
+    // 优先在底部标签栏/侧边菜单范围内找"学习"入口（v3.61 并入 ion-tab-button：
+    // 站点改版后 tab 是 ion-tab-button 而非 ion-tabbar button）
+    const scoped = $$("ion-tabbar button, .tabbar button, ion-tabs button, ion-tab-button, exe-menus button")
       .find((b) => (b.textContent || "").replace(/\s+/g, "").includes("学习"));
     let btn = scoped || undefined;
     if (!btn) {
-      // 兜底：屏幕下方 40% 区域内文本恰为"学习"的按钮（避开正文里的同名链接）
+      // 兜底一：屏幕下方 40% 区域内文本恰为"学习"的按钮（避开正文里的同名链接）
       btn = $$("button").find((b) => {
         if ((b.textContent || "").replace(/\s+/g, "") !== "学习") return false;
         const r = b.getBoundingClientRect();
         return r.top > window.innerHeight * 0.6;
       });
+    }
+    if (!btn) {
+      // 兜底二（v3.61 并入）：全页文本恰为"学习/去学习"的可点元素，点击其
+      // 最近的按钮容器（Ionic 常把文字放在内层 span，事件在容器上）。
+      const cand = $$("button, ion-tab-button, ion-item, [role='tab'], a, div, span").find((el) => {
+        if (!(el.textContent || "").trim()) return false;
+        if (!/^(学习|去学习)$/.test((el.textContent || "").replace(/\s+/g, ""))) return false;
+        const r = el.getBoundingClientRect();
+        if (!r.width || !r.height) return false;
+        return r.top > window.innerHeight * 0.5;
+      });
+      if (cand) btn = cand.closest("button, ion-tab-button, ion-item, [role='tab'], a") || cand;
     }
     if (btn) {
       btn.click();
@@ -2046,9 +2810,28 @@
       warn("打开课件超时（" + CFG.stuckOpenSec + "s 未出现播放器）");
       const m = overlays()[0];
       if (m) dismissModal(m);
+      dismissPlayerModal();
       setState("idle");
-      // 反复打不开：自愈刷新（走熔断保护），避免在同一条目上空转
-      if (++openTries >= 3) {
+      // 打不开的阶梯（v3.61 并入）：跨刷新累计失败次数（内存 openTries 刷新即清零，
+      // 抓不住"刷新也没用"）。第 2 次先退出课程重进；第 3 次把课件记入 30 分钟
+      // 暂缓并退出课程换下一个；无标签时退回普通刷新（走熔断保护）。
+      const label = currentMediaLabel || "";
+      const failN = label ? bumpOpenFail(label) : ++openTries;
+      if (failN >= 3 && label) {
+        openTries = 0;
+        addOpenFail(label);
+        record("WARN", "课件「" + label.slice(0, 24) + "」反复打不开（跨刷新第 " + failN +
+          " 次），暂缓 30 分钟，换下一个课件");
+        exitCourseForRecovery("课件反复打不开");
+        return;
+      }
+      if (failN === 2 && label && !reenterTried) {
+        reenterTried = true;
+        record("WARN", "课件打不开（跨刷新第 2 次），退出课程重进");
+        exitCourseForRecovery("课件打不开，退出重进");
+        return;
+      }
+      if (!label && openTries >= 3) {
         openTries = 0;
         doReload("课件反复打不开（已尝试 3 次）");
       }
@@ -2135,7 +2918,22 @@
     let chainRan = false; // 本拍是否走了多步流程（链内耗时是正常等待，不算卡顿）
     try {
       ensureUI();
-      if (!running || inState("halt")) return;
+      if (offlineWait) { offlineProbeTick(); return; } // 断网：只轮询恢复，其余动作全停
+      if (inState("halt")) { maybeRearmFromHalt(); return; } // 熔断：冷却+探网，自动复跑
+      if (!running) return;
+      // 点击锁观察（v3.61 并入）：Ionic 的 click-block-enabled 遮罩残留在页面上时
+      // 所有点击都会被吞（弹窗动画中断的典型后遗症）。持续 8s 且不在评价/保存
+      // 流程（这两步正常会短暂出现）就强制摘除。
+      if ($$(".click-block-enabled").length > 0) {
+        if (!cbSince) cbSince = now();
+        else if (now() - cbSince > 8000 && !inState("evaluating", "saving")) {
+          cbSince = 0;
+          record("WARN", "点击锁遮罩持续 8s（非评价流程），强制摘除");
+          unstickLoading();
+        }
+      } else {
+        cbSince = 0;
+      }
       if (now() < busyUntil) {
         // 条件早释放：预期结果已出现就立即放行，不等满锁时长
         if (!safeCond()) {
@@ -2184,33 +2982,69 @@
       if ($("course-detail-page")) {
         otherPageSince = 0;
         hiddenWaitActive = false;
+        loginPageHits = 0;
+        // 到达正常页面：清掉登录疑似/启动失败的跨刷新标记（仅非零时写，避免每拍写 localStorage）
+        if (store.get("authBustTried", 0)) store.set("authBustTried", 0);
+        if (store.get("deadBoots", 0)) store.set("deadBoots", 0);
         chainRan = true;
         await handleCourseDetail();
       } else if ($("page-learn")) {
         otherPageSince = 0;
         hiddenWaitActive = false;
+        loginPageHits = 0;
+        if (store.get("authBustTried", 0)) store.set("authBustTried", 0);
+        if (store.get("deadBoots", 0)) store.set("deadBoots", 0);
         chainRan = true;
         await handleLearnPage();
       } else {
         if (!otherPageSince) otherPageSince = now();
-        // 首页/登录页/其它：先自动切到底部"学习"标签，切不过去再提示
+        // 首页/登录页/其它：先自动切到底部"学习"标签，切不过去再分类处置
         if (gotoLearnTab()) {
           lock(5000, () => !!$("page-learn"), "等待学习页[" + (document.title || "?").slice(0, 12) + "]");
           return;
         }
-        // 标题已被心跳占用（v3.27），登录判定改用 URL+DOM（更硬的信号，不依赖标题）
-        const maybeLogin = /login/i.test(location.href) || !!$("page-login");
-        titleFlag = maybeLogin ? "login" : "";
-        noteOnce("other-page", "不在学习页/课程页（" + document.title + "）");
-        setStatus(maybeLogin ? "请重新登录" : "非学习页面",
-          maybeLogin ? "登录后脚本自动继续" : "未找到学习页入口");
+        // ---- 未知页分类（v3.61 并入）：登录页 / 站点启动失败页 / 其它 ----
+        // 标题已被心跳占用（v3.27），登录判定用 URL + DOM + 登录态存储三信号。
+        const onLoginUrl = /login/i.test(location.href) || !!$("page-login");
+        const loginLooks = looksLikeLoginPage();
+        const loggedIn = isLoggedInByStorage();
+        const maybeLogin = onLoginUrl || (loginLooks && !loggedIn);
+        if (maybeLogin) {
+          // 确认要连续两拍：单帧误检（登录文案闪现）不升级。确认前先试一次缓存
+          // 穿透刷新——站点偶发把未过期会话踢去登录页，bust 一次即回（跨刷新
+          // 标记防重复 bust）。
+          loginPageHits++;
+          const authBusted = store.get("authBustTried", 0);
+          if (loginPageHits < 2 && !authBusted && !pageHiddenReal()) {
+            store.set("authBustTried", now());
+            record("WARN", "疑似登录页（第 " + loginPageHits + " 拍），缓存穿透刷新确认一次");
+            doReload("疑似登录态失效，缓存穿透确认", bustHref());
+            return;
+          }
+          if (loginPageHits >= 2 || authBusted) {
+            titleFlag = "login";
+            noteOnce("login-expired", "登录已过期：请在页面里重新登录，脚本会自动继续");
+            setStatus("请重新登录", "登录后脚本自动继续（页面外监督者已通知）");
+            return; // 不走刷新阶梯：刷新解决不了登录
+          }
+        } else {
+          loginPageHits = 0;
+        }
+        // 已登录但导航没渲染出来 = 站点启动失败页（自愈刷新后可拖数分钟的那类）：
+        // 摘点击锁帮助它恢复，不设 login 旗标（监督者不会误报登录过期）。
+        if (loggedIn && !$$("ion-tab-button, ion-tabbar, ion-tabs, exe-menus").length) {
+          unstickLoading();
+          noteOnce("site-boot-fail", "站点启动异常（已登录但导航未渲染），自动重试中");
+          setStatus("站点启动异常", "自动重试中（先观察是否自恢复，不刷新）");
+        } else {
+          noteOnce("other-page", "不在学习页/课程页（" + document.title + "）");
+          setStatus("非学习页面", "未找到学习页入口");
+        }
         // 空转自愈：长时间停在既非学习页也非课程页的地方（v3.6 会在这里静默卡住）。
         // 后台例外（v3.24）：后台标签页里 SPA 不完成渲染，底部"学习"入口不出现，
         // 刷新只是白烧熔断额度，挂起计时等回前台。
-        // v3.25 修正：v3.24 只在 stuckSec>120 时 return，计时被挂在 60~120s 区间后
-        // 其余 tick 仍会走到全局看门狗——"超过 12 分钟无进展"照样刷新（日志实锤
-        // 循环 5 次直到熔断）。改为粘性等待：一旦判定后台等待，隐藏期间每拍都
-        // return；回前台才退出并恢复正常观察/刷新。
+        // v3.25 修正：粘性等待——一旦判定后台等待，隐藏期间每拍都 return；回前台
+        // 才退出并恢复正常观察/刷新。
         const stuckSec = Math.round((now() - otherPageSince) / 1000);
         if (!maybeLogin && running) {
           if (pageHiddenReal()) {
@@ -2228,7 +3062,12 @@
             }
             if (stuckSec > 180) {
               otherPageSince = 0;
-              doReload("长时间不在学习页/课程页（" + (document.title || "未知页面") + "）");
+              // 反复普通刷新仍起不来（≥2 次）→ 升级缓存穿透刷新（v3.61 并入：
+              // 启动失败页多为坏缓存/坏会话，普通刷新原样复现）
+              const db = store.get("deadBoots", 0);
+              store.set("deadBoots", db + 1);
+              doReload("长时间不在学习页/课程页（" + (document.title || "未知页面") + "）",
+                db >= 2 ? bustHref() : undefined);
               return;
             }
           }
@@ -2418,6 +3257,8 @@
   // 否则面板/设置抽屉会用默认值渲染，看起来就像"配置每次刷新都被重置"（v3.16 及之前的真实 bug）
   applyUserConfig();
   ensureUI();
+  const haltedAtBoot = store.get("halted", 0);
+  if (!running && haltedAtBoot) { haltAt = haltedAtBoot; setState("halt"); } // 熔断态+时刻跨刷新保持
   refreshStatus();         // 应用配置后刷新一次面板显示
   workerDriver = startWorkerDriver(); // Worker 后台驱动：主线程定时器被冻结时仍尽量推进
   record("INFO", "引擎启动 v" + VERSION + "（后台驱动：" + (workerDriver ? "已启用" : "不可用") + "）");
@@ -2432,5 +3273,7 @@
   if (running) { startAntiThrottle(); startSilentAudio(); }
   installVisibilitySpoof();
   installFocusSpoof();
+  installPauseGuard(); // 原型级 pause 拦截（v3.61 并入）：站点/播放器调 pause() 直接无效
+  installBlurSwallow(); // 站点早注册的 window blur 暂停监听改名吞掉（v3.61 并入）
   setTimeout(loop, 1000);
 })();
