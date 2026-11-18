@@ -26,6 +26,10 @@ if not exist "%CHROME%" (
 rem -- Isolated profile directory (independent from main Chrome)
 set "PROFILE=%LocalAppData%\zhixingli-chrome"
 
-start "" "%CHROME%" --user-data-dir="%PROFILE%" --no-first-run --no-default-browser-check --disable-background-timer-throttling --disable-backgrounding-occluded-windows --disable-renderer-backgrounding --disable-background-media-suspend --autoplay-policy=no-user-gesture-required --disable-features=IntensiveWakeUpThrottling,CalculateNativeWinOcclusion "https://u.exexm.com/"
+rem -- CDP debug port for the out-of-page watchdog (watchdog-zhixingli.ps1):
+rem    reads tab titles via http://127.0.0.1:9223/json to detect a frozen/dead
+rem    page and restart this instance. Loopback only; dedicated profile -- do
+rem    NOT sign into other important accounts in this instance (see README).
+start "" "%CHROME%" --user-data-dir="%PROFILE%" --no-first-run --no-default-browser-check --disable-background-timer-throttling --disable-backgrounding-occluded-windows --disable-renderer-backgrounding --disable-background-media-suspend --autoplay-policy=no-user-gesture-required --disable-features=IntensiveWakeUpThrottling,CalculateNativeWinOcclusion --remote-debugging-port=9223 "https://u.exexm.com/"
 
 endlocal

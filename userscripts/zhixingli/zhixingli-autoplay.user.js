@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         职行力自动刷课助手
 // @namespace    https://github.com/Lan-zk
-// @version      3.26
+// @version      3.27
 // @description  自动播放和评价职行力课程。克制的辅助仪器界面；自适应倍速；后台挂起自救（保活音源+低音量）；后台等待不烧熔断；卡死刷新重开；手动画中画；面板内设置与全量日志。
 // @author       Lan-zk
 // @source       https://greasyfork.org/scripts/455353
@@ -34,6 +34,14 @@
  *    (animated:false) 再直接摘 DOM（不再烧自愈刷新）；后台等待改粘性模式——
  *    此前计时被挂在 60~120s 区间，其余 tick 仍走到全局看门狗，"12 分钟无进展"
  *    照样放血（实测循环刷新 5 次直至熔断）。
+ * 5.8（v3.27）Worker 死亡自愈：主线程每拍检查 Worker 心跳，丢失 65s 即 terminate
+ *    重建——Worker 中途死掉不再静默退化为"后台 1 次/分钟"的节流模式（那正是
+ *    v3.24 修掉的连锁故障根源）。
+ * 7. 页面外监督者（v3.27）：心跳写入 document.title（5s 粒度，格式
+ *    职行力|run/stop|state或login|unix秒），watchdog-zhixingli.ps1 经专用实例的
+ *    CDP /json 轮询标题。整页冻结/浏览器崩溃这类"页面内代码无法感知自己已死"的
+ *    故障由监督者杀进程重启，本脚本从 localStorage 自动续跑；熔断/登录过期监督者
+ *    只发系统通知叫人。自愈链闭环：页内兜底 → 刷新 → 熔断 →（页外）重启。
  * 6. 日志与设置：均收敛在主面板内展开；全量动作/状态快照落盘（跨刷新保留），
  *    "复制排查信息"一键导出完整报告；设置即时生效并持久化，免改代码。
  *
@@ -44,7 +52,7 @@
 (function () {
   "use strict";
 
-  const VERSION = "3.26";
+  const VERSION = "3.27";
   const LOG_MAX = 2500; // 日志最多保留条数（超出丢弃最旧的；抽屉里最多渲染 800 条）
 
   // ===================== 配置 =====================
@@ -1066,15 +1074,32 @@
       if (t >= wakeWaiters[i].at) wakeWaiters.splice(i, 1)[0].r();
     }
   }
+  let workerDriver = null;
+  let lastWorkerBeat = 0; // Worker 最近一次心跳时间（主线程检测 Worker 死亡用）
   function startWorkerDriver() {
     try {
       const src = "let t=null;onmessage=function(e){if(e.data==='s'){if(!t){t=setInterval(function(){postMessage(0)},1000)}}else{clearInterval(t);t=null}};";
       const url = URL.createObjectURL(new Blob([src], { type: "text/javascript" }));
       const w = new Worker(url);
-      w.onmessage = () => { pumpWakes(); tick().catch(() => {}); };
+      lastWorkerBeat = now();
+      w.onmessage = () => { lastWorkerBeat = now(); pumpWakes(); tick().catch(() => {}); };
+      w.onerror = () => record("WARN", "后台 Worker 异常退出，主线程心跳检测将重建"); // 重建统一走心跳超时，单一路径
       w.postMessage("s");
       return w;
     } catch (e) { return null; } // CSP 等环境不支持时静默降级
+  }
+  // Worker 死亡自愈（v3.27）：Worker 中途死掉（CSP 变化/内存压力）后无人知晓，
+  // 后台悄悄退化成主线程 1 次/分钟的节流模式——v3.24 修掉的"流程链拖慢一个
+  // 数量级"会静默回归。主线程 loop 每拍检查心跳，超过 65s（Worker 本应 1s 一拍）
+  // 判定死亡：terminate 后重建。主线程再节流也有 1 次/分钟，检测延迟最多约 2 分钟。
+  function reviveWorkerIfDead() {
+    if (!workerDriver) return; // 从未建成（CSP 等）：不折腾
+    if (now() - lastWorkerBeat <= 65000) return;
+    try { workerDriver.terminate(); } catch (e) {}
+    workerDriver = startWorkerDriver();
+    record(workerDriver ? "WARN" : "ERROR",
+      workerDriver ? "Worker 心跳丢失，已重建后台驱动"
+        : "Worker 心跳丢失且重建失败（后台退化为节流模式，回前台自愈）");
   }
 
   // ---------- 弹窗治理 ----------
@@ -2076,9 +2101,27 @@
     } catch (e) { /* 快照失败不影响主流程 */ }
   }
 
+  // ---------- 页面外监督者心跳（v3.27） ----------
+  // 把运行状态与时间戳写进 document.title，watchdog-zhixingli.ps1 经专用实例的
+  // CDP /json 轮询读取（只需 HTTP）。整页冻结（连 Worker 一起死，页面内一切自愈
+  // 失效）时时间戳停走 → 监督者杀进程重启浏览器，本脚本从 localStorage 续跑；
+  // halt/登录过期由旗标告知监督者发系统通知。这是自愈链的最后一环：页面内代码
+  // 无法感知"自己整页已死"，只有页外看得见。
+  let titleBeatAt = 0;
+  let titleFlag = ""; // 额外旗标（login）：在页面分发段每拍重算
+  function titleBeat() {
+    const t = now();
+    if (t - titleBeatAt < 5000) return; // 5s 粒度足够（监督者阈值 10 分钟），少动标题栏
+    titleBeatAt = t;
+    try {
+      document.title = "职行力|" + (running ? "run" : "stop") + "|" + (titleFlag || state) + "|" + Math.floor(t / 1000);
+    } catch (e) { /* 标题写不进不影响功能 */ }
+  }
+
   // ---------- 主循环 ----------
   async function tick() {
     pumpWakes(); // 必须在重入保护之前：流程链的 workerSleep 靠每次心跳在这里被唤醒
+    titleBeat(); // 心跳写标题：在一切早退之前，任何路径下页面活着就有心跳
     if (ticking) return;
     ticking = true;
     const tickT0 = now();
@@ -2136,7 +2179,8 @@
       // 4. 弹窗治理
       if (modalGarbageCollect()) return;
 
-      // 5. 页面分发
+      // 5. 页面分发（titleFlag 每拍重算：login 旗标供页外监督者发通知；halt 由状态机值直接可见）
+      titleFlag = "";
       if ($("course-detail-page")) {
         otherPageSince = 0;
         hiddenWaitActive = false;
@@ -2154,7 +2198,9 @@
           lock(5000, () => !!$("page-learn"), "等待学习页[" + (document.title || "?").slice(0, 12) + "]");
           return;
         }
-        const maybeLogin = /login|登录/i.test(document.title || "") || $("page-login");
+        // 标题已被心跳占用（v3.27），登录判定改用 URL+DOM（更硬的信号，不依赖标题）
+        const maybeLogin = /login/i.test(location.href) || !!$("page-login");
+        titleFlag = maybeLogin ? "login" : "";
         noteOnce("other-page", "不在学习页/课程页（" + document.title + "）");
         setStatus(maybeLogin ? "请重新登录" : "非学习页面",
           maybeLogin ? "登录后脚本自动继续" : "未找到学习页入口");
@@ -2209,6 +2255,7 @@
 
   // 自调度循环（避免 setInterval 重叠；catch 兜底保证循环永不中断）
   function loop() {
+    reviveWorkerIfDead(); // 主线程后台至少 1 次/分钟，足够在 65s 阈值后发现 Worker 死亡
     tick()
       .catch(() => {})
       .finally(() => setTimeout(loop, CFG.interval));
@@ -2372,7 +2419,7 @@
   applyUserConfig();
   ensureUI();
   refreshStatus();         // 应用配置后刷新一次面板显示
-  const workerDriver = startWorkerDriver(); // Worker 后台驱动：主线程定时器被冻结时仍尽量推进
+  workerDriver = startWorkerDriver(); // Worker 后台驱动：主线程定时器被冻结时仍尽量推进
   record("INFO", "引擎启动 v" + VERSION + "（后台驱动：" + (workerDriver ? "已启用" : "不可用") + "）");
   const reason = store.get("reloadReason", "");
   if (reason) {
