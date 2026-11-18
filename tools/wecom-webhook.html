@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>企微群机器人 · webhook 发送</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --card: #fff; --fg: #1f2329; --muted: #86909c;
+    --line: #e5e6eb; --accent: #4f9e79; --err: #cf5b50; --code-bg: #f2f3f5;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #17181c; --card: #212329; --fg: #e8eaed; --muted: #8b909a;
+      --line: #33363e; --accent: #6bc49a; --err: #e07b70; --code-bg: #2a2d34;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 24px 16px; background: var(--bg); color: var(--fg);
+    font: 14px/1.6 system-ui, "Microsoft YaHei", sans-serif;
+  }
+  main { max-width: 560px; margin: 0 auto; }
+  h1 { font-size: 17px; margin: 0 0 4px; }
+  .sub { color: var(--muted); font-size: 12.5px; margin-bottom: 18px; }
+  .card {
+    background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+    padding: 16px; margin-bottom: 14px;
+  }
+  label { display: block; font-size: 12.5px; color: var(--muted); margin-bottom: 6px; }
+  input[type=text], input[type=password], textarea {
+    width: 100%; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px;
+    background: var(--bg); color: var(--fg); font: inherit;
+  }
+  textarea { min-height: 120px; resize: vertical; }
+  input:focus, textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  .row { display: flex; gap: 10px; align-items: center; margin-top: 8px; flex-wrap: wrap; }
+  .grow { flex: 1; }
+  button {
+    padding: 8px 18px; border: 0; border-radius: 8px; cursor: pointer;
+    background: var(--accent); color: #fff; font: inherit; font-weight: 600;
+  }
+  button:disabled { opacity: .45; cursor: default; }
+  button.ghost {
+    background: transparent; color: var(--fg); border: 1px solid var(--line);
+    font-weight: 400; padding: 8px 12px;
+  }
+  .cnt { font-size: 12px; color: var(--muted); text-align: right; margin-top: 4px; }
+  .cnt.over { color: var(--err); }
+  #resp {
+    font: 12px/1.5 Consolas, monospace; background: var(--code-bg);
+    border-radius: 8px; padding: 10px; white-space: pre-wrap; word-break: break-all;
+    min-height: 20px; color: var(--muted);
+  }
+  #resp.ok { color: var(--accent); }
+  #resp.bad { color: var(--err); }
+  .note { font-size: 12px; color: var(--muted); margin-top: 10px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>企微群机器人 · webhook 发送</h1>
+  <div class="sub">本地单文件工具，key 只发往 qyapi.weixin.qq.com，不经过任何第三方</div>
+
+  <div class="card">
+    <label for="key">Webhook key（或直接粘贴完整 webhook 地址）</label>
+    <input type="password" id="key" placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" autocomplete="off">
+    <div class="row">
+      <label style="margin:0; display:flex; align-items:center; gap:6px; font-size:12.5px; color:var(--muted)">
+        <input type="checkbox" id="remember"> 记住 key（存本机 localStorage）
+      </label>
+      <span class="grow"></span>
+      <button class="ghost" id="showkey">显示</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <label for="msg">消息内容（text）</label>
+    <textarea id="msg" placeholder="要发送的文本…&#10;Ctrl+Enter 发送"></textarea>
+    <div class="cnt"><span id="bytes">0</span> / 2048 字节</div>
+    <div class="row">
+      <span class="grow"></span>
+      <button id="send">发送</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <label>回执</label>
+    <div id="resp">尚未发送</div>
+    <div class="note">浏览器跨域限制时自动降级为 no-cors 盲发（消息仍会送达，但读不到回执）。频率限制：每机器人 20 条/分钟。</div>
+  </div>
+</main>
+
+<script>
+(function () {
+  "use strict";
+  var $ = function (id) { return document.getElementById(id); };
+  var elKey = $("key"), elMsg = $("msg"), elSend = $("send"), elResp = $("resp"),
+      elBytes = $("bytes"), elRemember = $("remember"), elShow = $("showkey");
+
+  // 记住的 key（仅勾选后写入；取消勾选即清除）
+  try {
+    var saved = localStorage.getItem("wecom-webhook-key");
+    if (saved) { elKey.value = saved; elRemember.checked = true; }
+  } catch (e) {}
+  elRemember.addEventListener("change", function () {
+    try {
+      if (elRemember.checked) localStorage.setItem("wecom-webhook-key", elKey.value.trim());
+      else localStorage.removeItem("wecom-webhook-key");
+    } catch (e) {}
+  });
+  elKey.addEventListener("input", function () {
+    try { if (elRemember.checked) localStorage.setItem("wecom-webhook-key", elKey.value.trim()); } catch (e) {}
+  });
+  elShow.addEventListener("click", function () {
+    elKey.type = elKey.type === "password" ? "text" : "password";
+    elShow.textContent = elKey.type === "password" ? "显示" : "隐藏";
+  });
+
+  // 字节计数（UTF-8）
+  function byteLen(s) { return new TextEncoder().encode(s).length; }
+  function refreshCnt() {
+    var n = byteLen(elMsg.value);
+    elBytes.textContent = n;
+    elBytes.parentElement.className = n > 2048 ? "cnt over" : "cnt";
+    elSend.disabled = !elMsg.value.trim() || !elKey.value.trim();
+  }
+  elMsg.addEventListener("input", refreshCnt);
+  elKey.addEventListener("input", refreshCnt);
+  refreshCnt();
+
+  function say(text, cls) { elResp.textContent = text; elResp.className = cls || ""; }
+
+  function webhookUrl() {
+    var v = elKey.value.trim();
+    if (v.indexOf("http") === 0) return v; // 粘贴了完整地址
+    return "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=" + encodeURIComponent(v);
+  }
+
+  function send() {
+    var url = webhookUrl();
+    var body = JSON.stringify({ msgtype: "text", text: { content: elMsg.value } });
+    elSend.disabled = true;
+    say("发送中…");
+    fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: body,
+    }).then(function (r) { return r.json(); }).then(function (j) {
+      if (j.errcode === 0) say(new Date().toLocaleTimeString("zh-CN", { hour12: false }) + " 发送成功：" + JSON.stringify(j), "ok");
+      else say(new Date().toLocaleTimeString("zh-CN", { hour12: false }) + " 被拒绝：" + JSON.stringify(j), "bad");
+    }).catch(function () {
+      // CORS/网络层失败：降级 no-cors 盲发（text/plain 触发简单请求，不预检；
+      // 企微服务端按原始字节解析 JSON，Content-Type 不影响）
+      fetch(url, { method: "POST", mode: "no-cors", headers: { "Content-Type": "text/plain" }, body: body })
+        .then(function () { say(new Date().toLocaleTimeString("zh-CN", { hour12: false }) + " 已盲发（no-cors，读不到回执；群里没收到即失败）", "ok"); })
+        .catch(function (e) { say("发送失败：" + (e && e.message ? e.message : e), "bad"); });
+    }).finally(function () { elSend.disabled = false; refreshCnt(); });
+  }
+
+  elSend.addEventListener("click", send);
+  elMsg.addEventListener("keydown", function (e) {
+    if ((e.ctrlKey || e.metaKey) && e.key === "Enter") send();
+  });
+})();
+</script>
+</body>
+</html>

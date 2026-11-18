@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         职行力自动刷课助手
 // @namespace    https://github.com/Lan-zk
-// @version      3.30
+// @version      3.31
 // @description  自动播放和评价职行力课程。克制的辅助仪器界面；自适应倍速；后台挂起自救（保活音源+低音量）；后台等待不烧熔断；卡死刷新重开；手动画中画；面板内设置与全量日志。
 // @author       Lan-zk
 // @source       https://greasyfork.org/scripts/455353
@@ -65,6 +65,11 @@
  *    stats 字段）。课程计数点补齐：无需评价的课程在"本次进入该课程完成过
  *    ≥1 节"时也计数（旧版只在评价完成时 +1，漏计）；进入时已全部完成的课程
  *    不计（不是脚本刷完的）。
+ * 5.12（v3.31）企微群机器人推送：key 在设置面板配置、存本机 localStorage（代码
+ *    零硬编码——v3.61 分支因 key 泄露未移植该功能，此为正确版）。推送点：课程
+ *    完成（带今日/累计统计）/ 全部完成 / 熔断 / 复跑 / 复跑用尽 / 登录过期；
+ *    按事件类型带冷却防重。跨域按两级发：标准 fetch（可读回执）失败则降级
+ *    no-cors 盲发（text/plain 免预检，企微按原始字节解析，消息仍送达）。
  * 7. 页面外监督者（v3.27）：心跳写入 document.title（5s 粒度，格式
  *    职行力|run/stop|state或login|unix秒），watchdog-zhixingli.ps1 经专用实例的
  *    CDP /json 轮询标题。整页冻结/浏览器崩溃这类"页面内代码无法感知自己已死"的
@@ -116,6 +121,7 @@
     // ---- 界面（辅助性：可淡化、可折叠、提示可静默） ----
     toastLevel: "all",         // 提示级别："all"=全部 / "warn"=仅异常警告 / "off"=静默（始终记日志）
     autoDim: true,             // 面板闲置 8 秒后自动淡化，鼠标移过即恢复
+    wecomKey: "",              // 企微群机器人 webhook key：非空时推送课程完成/全部完成/熔断/登录过期（仅存本机设置，代码零硬编码）
   };
   // ================================================
 
@@ -127,7 +133,7 @@
     "stars", "comment", "commentFallback", "playbackRate", "muted",
     "alertPolicy", "spoofFocus", "audibleKeepalive", "keepaliveVolume", "antiThrottle", "debug",
     "stuckOpenSec", "stuckPlayingSec", "stallResumeSec", "noProgressMin",
-    "reloadAfterHours", "heapLimitMB", "toastLevel", "autoDim",
+    "reloadAfterHours", "heapLimitMB", "toastLevel", "autoDim", "wecomKey",
   ];
   function applyUserConfig() {
     const saved = store.get("cfg", {});
@@ -329,6 +335,36 @@
   }
 
   function warn(msg) { console.warn("[职行力] " + msg); notify(msg, "error"); }
+
+  // ---------- 企微群机器人推送（v3.31）：key 在设置面板配置、存本机 localStorage，
+  // 代码零硬编码（v3.61 分支因 key 泄露教训未移植该功能，此为正确版）。推送点：
+  // 课程完成 / 全部完成 / 熔断 / 复跑 / 登录过期——只推关键节点，不推每节完成。 ----------
+  const wecomLastAt = {}; // 按 coolKey 的推送冷却（防同一事件每拍重复推）
+  function wecomPush(text, coolKey, coolMs) {
+    const key = String(CFG.wecomKey || "").trim();
+    if (!key) return;
+    if (coolKey) {
+      if (now() - (wecomLastAt[coolKey] || 0) < (coolMs || 600000)) return;
+      wecomLastAt[coolKey] = now();
+    }
+    const url = key.indexOf("http") === 0 ? key
+      : "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=" + encodeURIComponent(key);
+    const body = JSON.stringify({ msgtype: "text", text: { content: "【职行力】" + text } });
+    // 同源策略：页面域 != qyapi 域。先按标准 fetch 发（若 CORS 放行可读到回执）；
+    // 预检失败时请求体不会送达，再降级 no-cors 简单请求（text/plain 免预检，企微
+    // 按原始字节解析 JSON，消息仍送达，只是读不到回执）。推送是单向通知，够用。
+    fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body })
+      .then((r) => r.json())
+      .then((j) => {
+        if (j.errcode === 0) record("DBG", "企微推送成功：" + text.slice(0, 40));
+        else record("WARN", "企微推送被拒（key 失效或频率超限）：" + JSON.stringify(j).slice(0, 80));
+      })
+      .catch(() => {
+        fetch(url, { method: "POST", mode: "no-cors", headers: { "Content-Type": "text/plain" }, body })
+          .then(() => record("DBG", "企微推送已盲发（no-cors，读不到回执）：" + text.slice(0, 40)))
+          .catch((e) => record("WARN", "企微推送失败：" + ((e && e.message) || e)));
+      });
+  }
 
   // ---------- 运行时状态 ----------
   let running = store.get("running", false);
@@ -562,6 +598,7 @@
         setState("halt");
         setStatus("自动刷新过于频繁已熔断，冷却后将自动复跑（人工检查可直接停止）", reason);
         notify("⚠ 熔断：10分钟内自动刷新达上限（" + reason + "），停机待网络冷却后自动复跑", "fatal");
+        wecomPush("⛔ 熔断：" + reason + "｜冷却 15 分钟后自动复跑（最多 " + HALT_REARM_MAX + " 次）", "halt", 600000);
         return;
       }
       lastReloadAt = now(); // 提交刷新：5s 内后续 doReload 一律跳过
@@ -603,7 +640,10 @@
   async function maybeRearmFromHalt() {
     if (now() - haltAt < HALT_REARM_MIN * 60000) return;
     const rearms = store.get("haltRearms", 0);
-    if (rearms >= HALT_REARM_MAX) return;
+    if (rearms >= HALT_REARM_MAX) {
+      wecomPush("⛔ 熔断自动复跑已用尽（" + HALT_REARM_MAX + " 次），真停机，需人工处理", "halt-final", 3600000);
+      return;
+    }
     if (now() - rearmProbeAt < 30000) return; // 探测节流
     rearmProbeAt = now();
     if (!(await netOnline())) return;
@@ -616,6 +656,7 @@
     setState("idle");
     record("WARN", "熔断自动复跑：冷却已过且网络可达（第 " + (rearms + 1) + "/" + HALT_REARM_MAX + " 次）");
     notify("网络已恢复，熔断后自动复跑（第 " + (rearms + 1) + "/" + HALT_REARM_MAX + " 次）", "ok");
+    wecomPush("🔄 网络已恢复，熔断后自动复跑（第 " + (rearms + 1) + "/" + HALT_REARM_MAX + " 次）", "rearm", 300000);
     if (panelEls && panelEls.playBtn) {
       panelEls.playBtn.classList.add("on");
       panelEls.playBtn.textContent = "停止刷课";
@@ -2568,6 +2609,9 @@
         statBump("courses");
         courseVisitItems = 0;
         notify("✓ 课程评价完成（今日 " + todayStats().courses + " / 累计 " + stats.courses + " 课）", "ok");
+        wecomPush("✅ 课程完成（评价）：" + (currentCourseLabel || "?").slice(0, 24) +
+          "｜今日 " + todayStats().courses + " 课/" + todayStats().items + " 节 · 累计 " +
+          stats.courses + " 课/" + stats.items + " 节");
         await waitFor(() => !$("course-detail-page"), 3000);
         evalRetries = 0;
       } else {
@@ -2755,6 +2799,9 @@
         courseVisitItems = 0;
         notify("✓ 课程完成（无需评价；今日 " + todayStats().courses + " / 累计 " +
           stats.courses + " 课）", "ok");
+        wecomPush("✅ 课程完成：" + (currentCourseLabel || "?").slice(0, 24) +
+          "｜今日 " + todayStats().courses + " 课/" + todayStats().items + " 节 · 累计 " +
+          stats.courses + " 课/" + stats.items + " 节");
       }
       record("INFO", "课件已全部完成且无需评价，返回学习页");
       markExitIntent();
@@ -2817,6 +2864,7 @@
     } else {
       noteOnce("no-cards", "学习页没有可进入的在学课程");
       setStatus("没有在学课程", "学习页待命");
+      wecomPush("🎉 在学课程已全部完成｜累计 " + stats.courses + " 课/" + stats.items + " 节", "alldone", 1800000);
     }
   }
 
@@ -3077,6 +3125,7 @@
             titleFlag = "login";
             noteOnce("login-expired", "登录已过期：请在页面里重新登录，脚本会自动继续");
             setStatus("请重新登录", "登录后脚本自动继续（页面外监督者已通知）");
+            wecomPush("🔑 登录已过期，请到专用浏览器重新登录（登录后脚本自动继续）", "login", 1800000);
             return; // 不走刷新阶梯：刷新解决不了登录
           }
         } else {
@@ -3180,6 +3229,8 @@
     { key: "toastLevel", type: "select", label: "提示级别", tip: "右上角浮动提醒的打扰程度",
       options: [["all", "全部提示"], ["warn", "仅异常与警告"], ["off", "静默（仅记日志）"]] },
     { key: "autoDim", type: "switch", label: "面板自动淡化", tip: "闲置 8 秒后降低存在感，移过鼠标恢复" },
+    { sec: "通知" },
+    { key: "wecomKey", type: "text", label: "企微推送 key", tip: "群机器人 webhook key（或完整地址）；留空=不推送。仅存本机，推课程完成/全部完成/熔断/登录过期" },
     { sec: "调试" },
     { key: "debug", type: "switch", label: "控制台实时输出", tip: "日志始终全量记录到面板日志区" },
   ];
