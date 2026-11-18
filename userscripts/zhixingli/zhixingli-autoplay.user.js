@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         职行力自动刷课助手
 // @namespace    https://github.com/Lan-zk
-// @version      3.29
+// @version      3.30
 // @description  自动播放和评价职行力课程。克制的辅助仪器界面；自适应倍速；后台挂起自救（保活音源+低音量）；后台等待不烧熔断；卡死刷新重开；手动画中画；面板内设置与全量日志。
 // @author       Lan-zk
 // @source       https://greasyfork.org/scripts/455353
@@ -60,6 +60,11 @@
  *    h) 登录态真判定（localStorage.loginInfo + 密码框）+ 疑似过期先穿透刷新复核；
  *       click-block 遮罩看门狗（遮罩常驻会吞掉所有点击）；
  *    i) 单实例守卫 __zkBooted（TM 与页外工具双注入时先到者生效）。
+ * 5.11（v3.30）统计三维度：本次（点"开始刷课"清零，跨自动刷新/浏览器重启保留，
+ *    对应"一轮刷了多少"）/ 今日（本地日期分桶，保留 90 天）/ 累计（沿用旧
+ *    stats 字段）。课程计数点补齐：无需评价的课程在"本次进入该课程完成过
+ *    ≥1 节"时也计数（旧版只在评价完成时 +1，漏计）；进入时已全部完成的课程
+ *    不计（不是脚本刷完的）。
  * 7. 页面外监督者（v3.27）：心跳写入 document.title（5s 粒度，格式
  *    职行力|run/stop|state或login|unix秒），watchdog-zhixingli.ps1 经专用实例的
  *    CDP /json 轮询标题。整页冻结/浏览器崩溃这类"页面内代码无法感知自己已死"的
@@ -435,7 +440,32 @@
   const finishedMedia = new WeakSet(); // 已走完"播完收尾"流程的媒体元素（防重复计数/误退出）
   const progressedMedia = new WeakSet(); // 观测到过播放进度的媒体（用于统计只计真正看过的）
 
-  const stats = store.get("stats", { items: 0, courses: 0 });
+  // 统计三维度（v3.30）：累计（items/courses，沿用旧字段）/ 今日（days 按本地日期
+  // 分桶，保留 90 天）/ 本次（session，点"开始刷课"清零，跨自动刷新与浏览器重启
+  // 保留——持久化在 localStorage，对应"一轮刷了多少"）。
+  const stats = Object.assign({ items: 0, courses: 0, days: {}, session: null },
+    store.get("stats", {}));
+  const dayKey = () => {
+    const d = new Date();
+    return d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") + "-" +
+      String(d.getDate()).padStart(2, "0");
+  };
+  const todayStats = () => (stats.days && stats.days[dayKey()]) || { items: 0, courses: 0 };
+  function statBump(field) {
+    stats[field]++;
+    if (!stats.days) stats.days = {};
+    const k = dayKey();
+    stats.days[k] = stats.days[k] || { items: 0, courses: 0 };
+    stats.days[k][field]++;
+    const ks = Object.keys(stats.days).sort();
+    while (ks.length > 90) delete stats.days[ks.shift()]; // 只保留 90 天，防无限增长
+    if (!stats.session) stats.session = { items: 0, courses: 0, startedAt: now() };
+    stats.session[field]++;
+    store.set("stats", stats);
+  }
+  // 本次进入当前课程后完成的节数：课程完成计数只在 >0 时成立（进入时已全部
+  // 完成的课程不是脚本刷的，不计）；计完即清零防重复退出时双计。
+  let courseVisitItems = 0;
 
   function setState(s) {
     if (state !== s) {
@@ -831,6 +861,9 @@
         store.del("halted");   // 人工启动：清熔断态与复跑计数
         store.del("haltRearms");
         haltAt = 0;
+        // 新一轮统计起点：本次计数清零（累计/今日不动）
+        stats.session = { items: 0, courses: 0, startedAt: now() };
+        store.set("stats", stats);
         startAntiThrottle();
         startSilentAudio(); // 用户点击即手势，静音保活从这里开始生效
         installVisibilitySpoof(); // 点击时机安装，确保属性覆写成功
@@ -938,8 +971,12 @@
     }
     const mem = performance.memory
       ? Math.round(performance.memory.usedJSHeapSize / 1048576) + "MB" : "";
-    setStatus(main, "已刷 " + stats.items + " 节/" + stats.courses + " 课 · " +
-      fmtDur(now() - bootAt) + (mem ? " · " + mem : ""));
+    const td = todayStats();
+    const ses = stats.session;
+    setStatus(main, "本次 " + (ses ? ses.courses + " 课/" + ses.items + " 节" : "—") +
+      " · 今日 " + td.courses + " 课/" + td.items + " 节" +
+      " · 累计 " + stats.courses + " 课/" + stats.items + " 节" +
+      " · " + fmtDur(now() - bootAt) + (mem ? " · " + mem : ""));
     // 状态点：弱绿=运行，弱红=熔断，灰=停止。颜色只有三种，其余交给文字
     const dotColor = state === "halt" ? "#cf5b50" : (running ? "#4f9e79" : "#6b7075");
     if (panelEls.dot) panelEls.dot.style.background = dotColor;
@@ -1011,7 +1048,10 @@
         ? "还剩 " + ((busyUntil - now()) / 1000).toFixed(1) + "s：" + busyTag +
           (busyCheck ? (safeCond() ? "(条件已满足)" : "(条件未满足)") : "")
         : "无"),
-      "统计: " + stats.items + " 节 / " + stats.courses + " 课",
+      "统计: 累计 " + stats.items + " 节 / " + stats.courses + " 课；今日 " +
+        todayStats().items + " 节 / " + todayStats().courses + " 课；本次" +
+        (stats.session ? "（自 " + fmtTime(stats.session.startedAt) + "）" + stats.session.items +
+          " 节 / " + stats.session.courses + " 课" : "：未开始"),
       "内存: " + mem,
       "近10分钟自愈刷新: " + (recentReloads().length ? recentReloads().map(fmtTime).join(",") : "无"),
       "配置: " + JSON.stringify(CFG),
@@ -1820,9 +1860,9 @@
     // 立即记账 + 防重播护栏：不等收尾链跑完（链可能被后台冻结打断，晚记会漏护栏导致重播）
     markDone(currentMediaLabel);
     if (media && progressedMedia.has(media)) {
-      stats.items++;
-      store.set("stats", stats);
-      notify("✓ 已完成 1 节（累计 " + stats.items + " 节）", "ok");
+      statBump("items");
+      courseVisitItems++;
+      notify("✓ 已完成 1 节（今日 " + todayStats().items + " / 累计 " + stats.items + " 节）", "ok");
     } else {
       record("INFO", "媒体接管时已处于播完状态，本节点不计入统计（是否完成交由站点判定）");
     }
@@ -2525,9 +2565,9 @@
         const back = $(".show-back-button");
         if (back) realClick(back);
         markEvalDone(currentCourseLabel); // 评价防重：30 分钟内不再对本课程提交评价
-        stats.courses++;
-        store.set("stats", stats);
-        notify("✓ 课程评价完成（累计 " + stats.courses + " 课）", "ok");
+        statBump("courses");
+        courseVisitItems = 0;
+        notify("✓ 课程评价完成（今日 " + todayStats().courses + " / 累计 " + stats.courses + " 课）", "ok");
         await waitFor(() => !$("course-detail-page"), 3000);
         evalRetries = 0;
       } else {
@@ -2571,7 +2611,11 @@
     // 可能短暂显示"全部已学"——稳定期内不做完成判定（v3.26：曾因此一进页面就评价，
     // 补报失败重进后又评了一次，同一门课被评两次）
     const cpage = $("course-detail-page");
-    if (cpage && cpage !== coursePageEl) { coursePageEl = cpage; courseEnterAt = now(); }
+    if (cpage && cpage !== coursePageEl) {
+      coursePageEl = cpage;
+      courseEnterAt = now();
+      courseVisitItems = 0; // 新课程：本次进入的完成节数重新计
+    }
     const media = playingMedia();
     if (media) { manageMedia(media); return; }
 
@@ -2704,6 +2748,14 @@
     const isEvalItem = !!(lastItem &&
       (lastItem.classList.contains("exam2_top") || /评价/.test(lastItem.innerText || "")));
     if (!isEvalItem) {
+      // 课程完成计数（v3.30）：无需评价的课程在此计数——仅当本次进入该课程完成过
+      // ≥1 节（进入时已全部完成的不算脚本刷的）；计完即清零，防返回失败重试时双计。
+      if (courseVisitItems > 0) {
+        statBump("courses");
+        courseVisitItems = 0;
+        notify("✓ 课程完成（无需评价；今日 " + todayStats().courses + " / 累计 " +
+          stats.courses + " 课）", "ok");
+      }
       record("INFO", "课件已全部完成且无需评价，返回学习页");
       markExitIntent();
       const back = $(".show-back-button");
